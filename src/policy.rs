@@ -106,25 +106,25 @@ fn deny_response(deny: &DenyConfig) -> ImmediateResponse {
 }
 
 fn matches_rule(matcher: &MatchConfig, req: &RequestInfo) -> bool {
-    if let Some(method) = &matcher.method {
-        if method.to_uppercase() != req.method.as_str() {
-            return false;
-        }
+    if let Some(method) = &matcher.method
+        && method.to_uppercase() != req.method.as_str()
+    {
+        return false;
     }
-    if let Some(scheme) = &matcher.scheme {
-        if scheme != req.url.scheme() {
-            return false;
-        }
+    if let Some(scheme) = &matcher.scheme
+        && scheme != req.url.scheme()
+    {
+        return false;
     }
-    if let Some(host) = &matcher.host {
-        if !host_matches(host, req.url.host_str().unwrap_or_default()) {
-            return false;
-        }
+    if let Some(host) = &matcher.host
+        && !host_matches(host, req.url.host_str().unwrap_or_default())
+    {
+        return false;
     }
-    if let Some(path_prefix) = &matcher.path_prefix {
-        if !req.url.path().starts_with(path_prefix) {
-            return false;
-        }
+    if let Some(path_prefix) = &matcher.path_prefix
+        && !req.url.path().starts_with(path_prefix)
+    {
+        return false;
     }
     true
 }
