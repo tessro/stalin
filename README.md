@@ -10,6 +10,7 @@ This repository currently contains the first working implementation:
   session handling.
 - Explicit HTTP proxying for absolute-form `HTTP_PROXY` requests.
 - HTTPS `CONNECT` tunneling with host-level allow, deny, and audit decisions.
+- HTTP/1.1 upgrade tunneling for WebSocket-style proxy traffic.
 - Rule-driven request header mutation.
 - V8 request-header plugins with secret, audit, crypto, and clock host APIs.
 - Secret-backed header values from environment variables.

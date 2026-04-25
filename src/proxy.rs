@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri, Version};
 use pingora::{
     apps::{HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream},
     connectors::http::Connector,
     http::{RequestHeader, ResponseHeader},
-    protocols::http::ServerSession,
+    protocols::http::{ServerSession, client::HttpSession as UpstreamHttpSession},
     server::Server,
     services::listening::Service,
     upstreams::peer::HttpPeer,
@@ -157,7 +157,6 @@ impl StalinPingoraApp {
             }
         }
 
-        let body = read_body(http).await?;
         let peer = upstream_peer(&target).await?;
         let mut upstream_req = upstream_request(method, &target, &outbound_headers)?;
         set_host_header(&mut upstream_req, &target)?;
@@ -166,10 +165,7 @@ impl StalinPingoraApp {
         upstream
             .write_request_header(Box::new(upstream_req))
             .await?;
-        if !body.is_empty() {
-            upstream.write_request_body(body.freeze(), true).await?;
-        }
-        upstream.finish_request_body().await?;
+        stream_request_body(http, &mut upstream).await?;
         upstream.read_response_header().await?;
 
         write_upstream_response(http, &mut upstream).await?;
@@ -250,15 +246,117 @@ impl StalinPingoraApp {
 
     async fn handle_upgrade(
         &self,
-        mut http: ServerSession,
+        http: ServerSession,
     ) -> Result<Option<ServerSession>, ProxyError> {
-        write_immediate_response(
-            &mut http,
-            StatusCode::NOT_IMPLEMENTED,
-            Bytes::from_static(b"websocket proxying is not implemented yet\n"),
-        )
-        .await?;
-        Ok(Some(http))
+        let (method, target, protocol, outbound_headers) = {
+            let req = http.req_header();
+            (
+                req.method.clone(),
+                target_url(&req.uri, &req.headers)?,
+                protocol_name(req.version),
+                sanitized_upgrade_headers(&req.headers),
+            )
+        };
+        let request_info = RequestInfo::with_protocol(method.clone(), target.clone(), protocol);
+        let mut policy_headers = outbound_headers.clone();
+
+        match self
+            .policy
+            .evaluate(&request_info, &mut policy_headers)
+            .await?
+        {
+            PolicyDecision::Deny(resp) => {
+                let mut http = http;
+                write_immediate_response(&mut http, resp.status, resp.body).await?;
+                return Ok(Some(http));
+            }
+            PolicyDecision::Continue {
+                matched_rules,
+                upstream,
+            } => {
+                if upstream.is_some() {
+                    let mut http = http;
+                    write_immediate_response(
+                        &mut http,
+                        StatusCode::BAD_GATEWAY,
+                        Bytes::from_static(b"upgrade requests cannot be routed yet\n"),
+                    )
+                    .await?;
+                    return Ok(Some(http));
+                }
+                if !matched_rules.is_empty() {
+                    info!(
+                        request_id = %request_info.request_id,
+                        rules = ?matched_rules,
+                        url = %target,
+                        "upgrade policy applied"
+                    );
+                }
+            }
+        }
+
+        let ServerSession::H1(downstream) = http else {
+            let mut http = http;
+            write_immediate_response(
+                &mut http,
+                StatusCode::NOT_IMPLEMENTED,
+                Bytes::from_static(b"upgrade proxying is only implemented for HTTP/1\n"),
+            )
+            .await?;
+            return Ok(Some(http));
+        };
+
+        let peer = upstream_peer_with_version(&target, UpstreamVersion::Http1).await?;
+        let mut upstream_req = upstream_request(method, &target, &policy_headers)?;
+        set_host_header(&mut upstream_req, &target)?;
+        let (mut upstream, _) = self.connector.get_http_session(&peer).await?;
+        upstream
+            .write_request_header(Box::new(upstream_req))
+            .await?;
+        upstream.finish_request_body().await?;
+        upstream.read_response_header().await?;
+
+        let Some(upstream_header) = upstream.response_header().cloned() else {
+            return Err(ProxyError::BadGateway(anyhow::anyhow!(
+                "upstream upgrade response missing header"
+            )));
+        };
+        let upgraded = matches!(&upstream, UpstreamHttpSession::H1(h1) if h1.was_upgraded())
+            && upstream_header.status == StatusCode::SWITCHING_PROTOCOLS;
+        if !upgraded {
+            let mut http = ServerSession::H1(downstream);
+            write_upstream_response(&mut http, &mut upstream).await?;
+            return Ok(Some(http));
+        }
+
+        let mut response = ResponseHeader::build_no_case(
+            upstream_header.status,
+            Some(upstream_header.headers.len()),
+        )?;
+        for (name, value) in upstream_header.headers.iter() {
+            if should_skip_upgrade_response_header(name) {
+                continue;
+            }
+            response.append_header(name, value.clone())?;
+        }
+
+        let mut http = ServerSession::H1(downstream);
+        http.write_response_header(Box::new(response)).await?;
+        let ServerSession::H1(downstream) = http else {
+            unreachable!("session variant is unchanged");
+        };
+        let UpstreamHttpSession::H1(upstream) = upstream else {
+            unreachable!("upgrade response required an HTTP/1 upstream session");
+        };
+
+        let downstream = downstream.into_inner();
+        let upstream = upstream.into_inner();
+        tokio::spawn(async move {
+            if let Err(err) = tunnel_streams(downstream, upstream).await {
+                warn!(error = %err, "upgrade tunnel failed");
+            }
+        });
+        Ok(None)
     }
 }
 
@@ -273,12 +371,15 @@ async fn finish_session(http: ServerSession) -> Option<ReusedHttpStream> {
     }
 }
 
-async fn read_body(http: &mut ServerSession) -> Result<BytesMut, ProxyError> {
-    let mut body = BytesMut::new();
+async fn stream_request_body(
+    http: &mut ServerSession,
+    upstream: &mut pingora::protocols::http::client::HttpSession,
+) -> Result<(), ProxyError> {
     while let Some(chunk) = http.read_request_body().await? {
-        body.extend_from_slice(&chunk);
+        upstream.write_request_body(chunk, false).await?;
     }
-    Ok(body)
+    upstream.finish_request_body().await?;
+    Ok(())
 }
 
 async fn write_upstream_response(
@@ -351,6 +452,14 @@ async fn tunnel(
     Ok(())
 }
 
+async fn tunnel_streams(
+    mut downstream: pingora::protocols::Stream,
+    mut upstream: pingora::protocols::Stream,
+) -> anyhow::Result<()> {
+    copy_bidirectional(&mut downstream, &mut upstream).await?;
+    Ok(())
+}
+
 fn sanitized_headers(headers: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers {
@@ -366,11 +475,42 @@ fn sanitized_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
+fn sanitized_upgrade_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        if name == http::header::PROXY_AUTHORIZATION
+            || name.as_str().eq_ignore_ascii_case("proxy-connection")
+            || name == http::header::HOST
+        {
+            continue;
+        }
+        out.append(name, value.clone());
+    }
+    out
+}
+
 fn should_skip_response_header(name: &http::HeaderName) -> bool {
     name == http::header::CONNECTION || name.as_str().eq_ignore_ascii_case("transfer-encoding")
 }
 
+fn should_skip_upgrade_response_header(name: &http::HeaderName) -> bool {
+    name.as_str().eq_ignore_ascii_case("transfer-encoding")
+}
+
 async fn upstream_peer(target: &Url) -> Result<HttpPeer, ProxyError> {
+    upstream_peer_with_version(target, UpstreamVersion::Http2Preferred).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UpstreamVersion {
+    Http1,
+    Http2Preferred,
+}
+
+async fn upstream_peer_with_version(
+    target: &Url,
+    version: UpstreamVersion,
+) -> Result<HttpPeer, ProxyError> {
     let host = target
         .host_str()
         .ok_or_else(|| ProxyError::BadRequest("target URL is missing a host".to_string()))?;
@@ -383,9 +523,12 @@ async fn upstream_peer(target: &Url) -> Result<HttpPeer, ProxyError> {
     let addr = addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("upstream {host}:{port} resolved to no addresses"))?;
-    let tls = target.scheme() == "https";
+    let tls = matches!(target.scheme(), "https" | "wss");
     let mut peer = HttpPeer::new(addr, tls, host.to_string());
-    peer.options.set_http_version(2, 1);
+    match version {
+        UpstreamVersion::Http1 => peer.options.set_http_version(1, 1),
+        UpstreamVersion::Http2Preferred => peer.options.set_http_version(2, 1),
+    }
     Ok(peer)
 }
 
@@ -462,5 +605,61 @@ impl From<anyhow::Error> for ProxyError {
 impl From<Box<pingora::Error>> for ProxyError {
     fn from(value: Box<pingora::Error>) -> Self {
         Self::BadGateway(value.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::HeaderValue;
+
+    use super::*;
+
+    #[test]
+    fn upgrade_header_sanitization_preserves_upgrade_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade"),
+        );
+        headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(
+            http::header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("secret"),
+        );
+        headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
+
+        let sanitized = sanitized_upgrade_headers(&headers);
+
+        assert_eq!(
+            sanitized.get(http::header::CONNECTION).unwrap(),
+            HeaderValue::from_static("Upgrade")
+        );
+        assert_eq!(
+            sanitized.get(http::header::UPGRADE).unwrap(),
+            HeaderValue::from_static("websocket")
+        );
+        assert!(!sanitized.contains_key(http::header::PROXY_AUTHORIZATION));
+        assert!(!sanitized.contains_key(http::header::HOST));
+    }
+
+    #[test]
+    fn upstream_request_uses_origin_form_path_and_query() {
+        let target = Url::parse("http://example.com/socket?token=abc").unwrap();
+        let request = upstream_request(Method::GET, &target, &HeaderMap::new()).unwrap();
+
+        assert_eq!(request.uri, "/socket?token=abc");
+    }
+
+    #[test]
+    fn host_header_includes_explicit_port() {
+        let target = Url::parse("http://example.com:8080/").unwrap();
+        let mut request = upstream_request(Method::GET, &target, &HeaderMap::new()).unwrap();
+
+        set_host_header(&mut request, &target).unwrap();
+
+        assert_eq!(
+            request.headers.get(http::header::HOST).unwrap(),
+            HeaderValue::from_static("example.com:8080")
+        );
     }
 }

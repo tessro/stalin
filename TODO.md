@@ -2,14 +2,13 @@
 
 ## Core Proxy
 
-- Replace full request buffering with streamed forwarding through the Pingora
-  downstream and upstream sessions.
 - Implement true MITM TLS handling so HTTPS request/response headers and bodies
   can be inspected and modified.
 - Make HTTP/2 proxying first-class for both client-facing and upstream traffic.
 - Decide how to handle HTTP/3. Pingora 0.8 in this repo does not expose a QUIC
   or HTTP/3 listener API.
-- Add WebSocket upgrade handling and frame inspection on the Pingora path.
+- Add WebSocket frame inspection on the Pingora path. HTTP/1.1 upgrade
+  proxying is in place; inspection still needs frame parsing and plugin hooks.
 - Add container egress enforcement:
   - entrypoint script or supervisor for iptables setup
   - rules that limit monitored-container egress to the proxy daemon
@@ -27,7 +26,7 @@
 - Add response body hooks:
   - `onResponseBodyChunk`
   - `onResponseBodyEnd`
-- Replace full body buffering with streaming request/response handling.
+- Add plugin hook integration to the streamed request/response forwarding path.
 - Implement body hook actions:
   - `continue`
   - `replace`
