@@ -263,6 +263,14 @@ fn plugin_header_value(
 }
 
 pub fn target_url(uri: &Uri, headers: &HeaderMap) -> anyhow::Result<Url> {
+    target_url_with_default_scheme(uri, headers, "http")
+}
+
+pub fn target_url_with_default_scheme(
+    uri: &Uri,
+    headers: &HeaderMap,
+    default_scheme: &str,
+) -> anyhow::Result<Url> {
     if uri.scheme().is_some() && uri.authority().is_some() {
         return Ok(Url::parse(&uri.to_string())?);
     }
@@ -272,7 +280,7 @@ pub fn target_url(uri: &Uri, headers: &HeaderMap) -> anyhow::Result<Url> {
         .ok_or_else(|| anyhow::anyhow!("origin-form request is missing Host header"))?
         .to_str()?;
     let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    Ok(Url::parse(&format!("http://{host}{path}"))?)
+    Ok(Url::parse(&format!("{default_scheme}://{host}{path}"))?)
 }
 
 #[cfg(test)]
@@ -296,6 +304,15 @@ mod tests {
         headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
         let url = target_url(&"/v1?a=b".parse().unwrap(), &headers).unwrap();
         assert_eq!(url.as_str(), "http://example.com/v1?a=b");
+    }
+
+    #[test]
+    fn target_url_uses_default_scheme_for_origin_form() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
+        let url =
+            target_url_with_default_scheme(&"/v1?a=b".parse().unwrap(), &headers, "https").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/v1?a=b");
     }
 
     #[test]

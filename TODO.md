@@ -2,9 +2,12 @@
 
 ## Core Proxy
 
-- Implement true MITM TLS handling so HTTPS request/response headers and bodies
-  can be inspected and modified.
-- Make HTTP/2 proxying first-class for both client-facing and upstream traffic.
+- Extend MITM TLS beyond the current HTTP/1 CONNECT path:
+  - add HTTP/2-over-MITM support after downstream TLS ALPN negotiation
+  - expose CA generation/export workflow for local development
+  - add integration tests with a client that trusts the configured CA
+- Make HTTP/2 proxying first-class for both client-facing and upstream traffic,
+  including plugin hook coverage on h2 requests.
 - Decide how to handle HTTP/3. Pingora 0.8 in this repo does not expose a QUIC
   or HTTP/3 listener API.
 - Add WebSocket frame inspection on the Pingora path. HTTP/1.1 upgrade

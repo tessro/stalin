@@ -1,6 +1,14 @@
 listen = "0.0.0.0:8080"
 audit_log = "/tmp/stalin-audit.jsonl"
 
+# Enable this to inspect HTTPS requests after CONNECT. The CA certificate must
+# be trusted by the monitored client/container.
+#
+# [mitm]
+# enabled = true
+# ca_cert = "certs/stalin-ca.pem"
+# ca_key = "certs/stalin-ca-key.pem"
+
 [secrets.openai_api_key]
 env = "OPENAI_API_KEY"
 

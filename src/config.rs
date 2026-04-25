@@ -11,6 +11,7 @@ use serde::Deserialize;
 pub struct Config {
     pub listen: SocketAddr,
     pub audit_log: Option<String>,
+    pub mitm: MitmConfig,
     pub secrets: HashMap<String, SecretConfig>,
     pub rules: Vec<RuleConfig>,
     pub plugins: Vec<PluginConfig>,
@@ -23,6 +24,7 @@ impl Default for Config {
                 .parse()
                 .expect("default listen address is valid"),
             audit_log: None,
+            mitm: MitmConfig::default(),
             secrets: HashMap::new(),
             rules: Vec::new(),
             plugins: Vec::new(),
@@ -36,6 +38,16 @@ impl Config {
         let raw = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&raw)?;
         if let Some(parent) = path.parent() {
+            if let Some(ca_cert) = &mut config.mitm.ca_cert
+                && ca_cert.is_relative()
+            {
+                *ca_cert = parent.join(&ca_cert);
+            }
+            if let Some(ca_key) = &mut config.mitm.ca_key
+                && ca_key.is_relative()
+            {
+                *ca_key = parent.join(&ca_key);
+            }
             for plugin in &mut config.plugins {
                 if plugin.path.is_relative() {
                     plugin.path = parent.join(&plugin.path);
@@ -44,6 +56,14 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MitmConfig {
+    pub enabled: bool,
+    pub ca_cert: Option<PathBuf>,
+    pub ca_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,5 +172,22 @@ remove = ["x-placeholder-authorization"]
 
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(cfg.rules[0].name, "openai");
+    }
+
+    #[test]
+    fn parses_mitm_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+[mitm]
+enabled = true
+ca_cert = "certs/ca.pem"
+ca_key = "certs/ca-key.pem"
+"#,
+        )
+        .unwrap();
+
+        assert!(cfg.mitm.enabled);
+        assert_eq!(cfg.mitm.ca_cert.unwrap(), PathBuf::from("certs/ca.pem"));
+        assert_eq!(cfg.mitm.ca_key.unwrap(), PathBuf::from("certs/ca-key.pem"));
     }
 }

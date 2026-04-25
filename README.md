@@ -10,6 +10,8 @@ This repository currently contains the first working implementation:
   session handling.
 - Explicit HTTP proxying for absolute-form `HTTP_PROXY` requests.
 - HTTPS `CONNECT` tunneling with host-level allow, deny, and audit decisions.
+- Optional HTTP/1.1 MITM TLS interception for CONNECT requests when configured
+  with a trusted local CA.
 - HTTP/1.1 upgrade tunneling for WebSocket-style proxy traffic.
 - Rule-driven request header mutation.
 - V8 request-header plugins with secret, audit, crypto, and clock host APIs.
@@ -17,8 +19,8 @@ This repository currently contains the first working implementation:
 - JSONL audit logging.
 - Docker and Compose examples for sidecar deployment.
 
-Deep TLS MITM body inspection and streaming body hooks described in `PLAN.md`
-are intentionally isolated as follow-on work.
+HTTP/2-over-MITM, deep body inspection, and streaming body hooks described in
+`PLAN.md` are intentionally isolated as follow-on work.
 
 ## Run
 
@@ -39,8 +41,19 @@ See [examples/stalin.toml](examples/stalin.toml).
 
 Rules are evaluated in order. A matching `deny` stops the request. Header
 patches apply only to inspectable HTTP requests; `CONNECT` requests are
-encrypted tunnels, so Stalin can audit or block the target authority but cannot
-rewrite inner HTTPS headers without a future MITM mode.
+encrypted tunnels unless `[mitm]` is enabled and the monitored client trusts the
+configured CA certificate.
+
+```toml
+[mitm]
+enabled = true
+ca_cert = "certs/stalin-ca.pem"
+ca_key = "certs/stalin-ca-key.pem"
+```
+
+MITM mode currently advertises HTTP/1.1 to the client side of the intercepted
+TLS session. Upstream requests can still use TLS and Pingora's upstream HTTP/2
+preference.
 
 ## V8 Plugins
 
