@@ -1,0 +1,27 @@
+listen: 0.0.0.0:8080
+audit_log: /tmp/stalin-audit.jsonl
+
+secrets:
+  openai_api_key:
+    env: OPENAI_API_KEY
+
+rules:
+  - name: block-instance-metadata
+    match:
+      host: 169.254.169.254
+    deny:
+      status: 403
+      body: "metadata service access is blocked\n"
+    audit: true
+
+  - name: openai-auth
+    match:
+      host: api.openai.com
+    request_headers:
+      set:
+        authorization:
+          secret: openai_api_key
+          format: "Bearer {value}"
+      remove:
+        - x-placeholder-authorization
+    audit: true

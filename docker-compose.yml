@@ -1,0 +1,20 @@
+services:
+  proxy:
+    build: .
+    cap_add:
+      - NET_ADMIN
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
+      STALIN_CONFIG: /etc/stalin/stalin.yml
+    ports:
+      - "8080:8080"
+
+  agent:
+    image: curlimages/curl:8.11.0
+    command: ["sleep", "infinity"]
+    environment:
+      HTTP_PROXY: http://proxy:8080
+      HTTPS_PROXY: http://proxy:8080
+      NO_PROXY: localhost,127.0.0.1
+    depends_on:
+      - proxy
