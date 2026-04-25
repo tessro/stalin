@@ -26,6 +26,10 @@ impl SecretStore {
             env: cfg.env.clone(),
         })
     }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.configs.keys().map(String::as_str)
+    }
 }
 
 #[derive(Debug, Error)]

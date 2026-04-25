@@ -37,7 +37,7 @@ impl ProxyServer {
                 .http2_adaptive_window(true)
                 .http2_keep_alive_interval(std::time::Duration::from_secs(30))
                 .build()?,
-            policy: PolicyEngine::new(self.config, audit),
+            policy: PolicyEngine::new(self.config, audit)?,
         };
 
         let app = Router::new()
@@ -68,7 +68,7 @@ async fn handle_proxy(
     }
 
     let method = req.method().clone();
-    let target = target_url(req.uri(), req.headers())?;
+    let mut target = target_url(req.uri(), req.headers())?;
     let request_info = RequestInfo::new(method.clone(), target.clone());
     let mut outbound_headers = sanitized_headers(req.headers());
 
@@ -78,7 +78,13 @@ async fn handle_proxy(
         .await?
     {
         PolicyDecision::Deny(resp) => return Ok(immediate_response(resp.status, resp.body)),
-        PolicyDecision::Continue { matched_rules } => {
+        PolicyDecision::Continue {
+            matched_rules,
+            upstream,
+        } => {
+            if let Some(upstream) = upstream {
+                target = routed_url(upstream, &target);
+            }
             if !matched_rules.is_empty() {
                 info!(
                     request_id = %request_info.request_id,
@@ -122,7 +128,7 @@ async fn handle_connect(
 
     match state.policy.evaluate(&request_info, &mut headers).await? {
         PolicyDecision::Deny(resp) => return Ok(immediate_response(resp.status, resp.body)),
-        PolicyDecision::Continue { matched_rules } => {
+        PolicyDecision::Continue { matched_rules, .. } => {
             if !matched_rules.is_empty() {
                 info!(
                     request_id = %request_info.request_id,
@@ -180,6 +186,14 @@ fn connect_target_url(uri: &Uri, authority: &str) -> anyhow::Result<Url> {
         return Ok(Url::parse(&uri.to_string())?);
     }
     Ok(Url::parse(&format!("https://{authority}/"))?)
+}
+
+fn routed_url(mut upstream: Url, original: &Url) -> Url {
+    if upstream.path() == "/" && upstream.query().is_none() {
+        upstream.set_path(original.path());
+        upstream.set_query(original.query());
+    }
+    upstream
 }
 
 async fn response_from_upstream(upstream: reqwest::Response) -> Result<Response<Body>, ProxyError> {

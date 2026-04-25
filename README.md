@@ -9,14 +9,13 @@ This repository currently contains the first working implementation:
 - Explicit HTTP proxying for absolute-form `HTTP_PROXY` requests.
 - HTTPS `CONNECT` tunneling with host-level allow, deny, and audit decisions.
 - Rule-driven request header mutation.
+- V8 request-header plugins with secret, audit, crypto, and clock host APIs.
 - Secret-backed header values from environment variables.
 - JSONL audit logging.
 - Docker and Compose examples for sidecar deployment.
 
-Deep TLS MITM body inspection and the V8 JavaScript plugin host described in
-`PLAN.md` are intentionally isolated as follow-on work. The policy model and
-TypeScript declarations are laid out so those hooks can be wired in without
-reworking proxy request handling.
+Deep TLS MITM body inspection and streaming body hooks described in `PLAN.md`
+are intentionally isolated as follow-on work.
 
 ## Run
 
@@ -39,3 +38,22 @@ Rules are evaluated in order. A matching `deny` stops the request. Header
 patches apply only to inspectable HTTP requests; `CONNECT` requests are
 encrypted tunnels, so Stalin can audit or block the target authority but cannot
 rewrite inner HTTPS headers without a future MITM mode.
+
+## V8 Plugins
+
+Request-header plugins are configured in TOML:
+
+```toml
+[[plugins]]
+name = "openai-auth"
+version = "0.1.0"
+path = "openai-auth.plugin.ts"
+```
+
+Plugin paths are resolved relative to the config file. Stalin uses `esbuild`
+from `PATH` to bundle TypeScript/JavaScript plugins before loading them into
+V8. If `esbuild` is unavailable or bundling fails, Stalin logs a warning and
+skips that plugin.
+
+See [examples/openai-auth.plugin.ts](examples/openai-auth.plugin.ts) and
+[plugins/proxy.d.ts](plugins/proxy.d.ts).

@@ -4,6 +4,13 @@ audit_log = "/tmp/stalin-audit.jsonl"
 [secrets.openai_api_key]
 env = "OPENAI_API_KEY"
 
+# Enable this to run the V8 request-header example plugin.
+#
+# [[plugins]]
+# name = "openai-auth"
+# version = "0.1.0"
+# path = "openai-auth.plugin.ts"
+
 [[rules]]
 name = "block-instance-metadata"
 audit = true

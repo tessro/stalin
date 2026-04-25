@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::{
     audit::{AuditEvent, AuditLog},
     config::{Config, DenyConfig, HeaderPatchConfig, HeaderValueConfig, MatchConfig, RuleConfig},
+    plugin::{PluginHeaderPatch, PluginResult, PluginRuntime},
     secrets::SecretStore,
 };
 
@@ -14,15 +15,19 @@ pub struct PolicyEngine {
     rules: Vec<RuleConfig>,
     secrets: SecretStore,
     audit: AuditLog,
+    plugins: Option<PluginRuntime>,
 }
 
 impl PolicyEngine {
-    pub fn new(config: Config, audit: AuditLog) -> Self {
-        Self {
+    pub fn new(config: Config, audit: AuditLog) -> anyhow::Result<Self> {
+        let secrets = SecretStore::new(config.secrets.clone());
+        let plugins = PluginRuntime::new(config.plugins, secrets.clone(), audit.clone())?;
+        Ok(Self {
             rules: config.rules,
-            secrets: SecretStore::new(config.secrets),
+            secrets,
             audit,
-        }
+            plugins,
+        })
     }
 
     pub async fn evaluate(
@@ -59,7 +64,41 @@ impl PolicyEngine {
             apply_patch(headers, &rule.request_headers, &self.secrets)?;
         }
 
-        Ok(PolicyDecision::Continue { matched_rules })
+        let mut upstream = None;
+        if let Some(plugins) = &self.plugins {
+            for outcome in plugins.on_request_headers(req, headers).await? {
+                match &outcome.result {
+                    PluginResult::Continue { .. } => {
+                        if let Some(patch) = outcome.result.patches() {
+                            apply_plugin_patch(headers, patch, &self.secrets)?;
+                        }
+                        matched_rules.push(format!("plugin:{}", outcome.plugin_name));
+                    }
+                    PluginResult::Route {
+                        upstream: route_upstream,
+                        ..
+                    } => {
+                        if let Some(patch) = outcome.result.patches() {
+                            apply_plugin_patch(headers, patch, &self.secrets)?;
+                        }
+                        upstream = Some(Url::parse(route_upstream)?);
+                        matched_rules.push(format!("plugin:{}", outcome.plugin_name));
+                    }
+                    PluginResult::Deny { status, body }
+                    | PluginResult::Respond { status, body } => {
+                        return Ok(PolicyDecision::Deny(ImmediateResponse {
+                            status: StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN),
+                            body: Bytes::from(body.clone().unwrap_or_default()),
+                        }));
+                    }
+                }
+            }
+        }
+
+        Ok(PolicyDecision::Continue {
+            matched_rules,
+            upstream,
+        })
     }
 }
 
@@ -84,7 +123,10 @@ impl RequestInfo {
 
 #[derive(Debug)]
 pub enum PolicyDecision {
-    Continue { matched_rules: Vec<String> },
+    Continue {
+        matched_rules: Vec<String>,
+        upstream: Option<Url>,
+    },
     Deny(ImmediateResponse),
 }
 
@@ -157,6 +199,26 @@ fn apply_patch(
     Ok(())
 }
 
+fn apply_plugin_patch(
+    headers: &mut HeaderMap,
+    patch: PluginHeaderPatch<'_>,
+    secrets: &SecretStore,
+) -> anyhow::Result<()> {
+    for name in patch.remove_headers {
+        headers.remove(header_name(name)?);
+    }
+
+    for (name, value) in patch.set_headers {
+        headers.insert(header_name(name)?, plugin_header_value(value, secrets)?);
+    }
+
+    for (name, value) in patch.add_headers {
+        headers.append(header_name(name)?, plugin_header_value(value, secrets)?);
+    }
+
+    Ok(())
+}
+
 fn header_name(name: &str) -> anyhow::Result<HeaderName> {
     Ok(HeaderName::from_bytes(name.as_bytes())?)
 }
@@ -168,6 +230,28 @@ fn header_value(value: &HeaderValueConfig, secrets: &SecretStore) -> anyhow::Res
             let secret = secrets.text(secret)?;
             format.replace("{value}", &secret)
         }
+    };
+    Ok(HeaderValue::from_str(&raw)?)
+}
+
+fn plugin_header_value(
+    value: &serde_json::Value,
+    secrets: &SecretStore,
+) -> anyhow::Result<HeaderValue> {
+    let raw = match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Object(object) => {
+            let secret_name = object
+                .get("secret")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("plugin header object must include `secret`"))?;
+            let format = object
+                .get("format")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("{value}");
+            format.replace("{value}", &secrets.text(secret_name)?)
+        }
+        _ => anyhow::bail!("plugin header value must be a string or secret object"),
     };
     Ok(HeaderValue::from_str(&raw)?)
 }

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr, path::Path};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -9,6 +13,7 @@ pub struct Config {
     pub audit_log: Option<String>,
     pub secrets: HashMap<String, SecretConfig>,
     pub rules: Vec<RuleConfig>,
+    pub plugins: Vec<PluginConfig>,
 }
 
 impl Default for Config {
@@ -20,14 +25,24 @@ impl Default for Config {
             audit_log: None,
             secrets: HashMap::new(),
             rules: Vec::new(),
+            plugins: Vec::new(),
         }
     }
 }
 
 impl Config {
     pub fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
         let raw = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+        let mut config: Self = toml::from_str(&raw)?;
+        if let Some(parent) = path.parent() {
+            for plugin in &mut config.plugins {
+                if plugin.path.is_relative() {
+                    plugin.path = parent.join(&plugin.path);
+                }
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -35,6 +50,20 @@ impl Config {
 #[serde(rename_all = "snake_case")]
 pub struct SecretConfig {
     pub env: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginConfig {
+    pub name: String,
+    #[serde(default = "default_plugin_version")]
+    pub version: String,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub config: Option<toml::Value>,
+}
+
+fn default_plugin_version() -> String {
+    "0.1.0".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
