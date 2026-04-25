@@ -108,15 +108,21 @@ pub struct RequestInfo {
     pub connection_id: String,
     pub method: Method,
     pub url: Url,
+    pub protocol: &'static str,
 }
 
 impl RequestInfo {
     pub fn new(method: Method, url: Url) -> Self {
+        Self::with_protocol(method, url, "http/1.1")
+    }
+
+    pub fn with_protocol(method: Method, url: Url, protocol: &'static str) -> Self {
         Self {
             request_id: Uuid::new_v4().to_string(),
             connection_id: Uuid::new_v4().to_string(),
             method,
             url,
+            protocol,
         }
     }
 }

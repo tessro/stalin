@@ -1,8 +1,8 @@
-use std::{path::Path, sync::Arc};
+use std::{fs::OpenOptions, path::Path, sync::Arc};
 
 use anyhow::Context;
 use serde::Serialize;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
+use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
 
 #[derive(Clone)]
 pub struct AuditLog {
@@ -16,16 +16,15 @@ enum AuditSink {
 }
 
 impl AuditLog {
-    pub async fn new(path: Option<&str>) -> anyhow::Result<Self> {
+    pub fn new(path: Option<&str>) -> anyhow::Result<Self> {
         let sink = match path {
             Some(path) => {
                 let file = OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(Path::new(path))
-                    .await
                     .with_context(|| format!("failed to open audit log {path}"))?;
-                AuditSink::File(Arc::new(Mutex::new(file)))
+                AuditSink::File(Arc::new(Mutex::new(File::from_std(file))))
             }
             None => AuditSink::Stdout,
         };

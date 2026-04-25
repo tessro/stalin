@@ -6,6 +6,8 @@ audits requests, and can block traffic by request shape.
 
 This repository currently contains the first working implementation:
 
+- Pingora-owned downstream and upstream proxy path with HTTP/1.1 and HTTP/2
+  session handling.
 - Explicit HTTP proxying for absolute-form `HTTP_PROXY` requests.
 - HTTPS `CONNECT` tunneling with host-level allow, deny, and audit decisions.
 - Rule-driven request header mutation.

@@ -1,0 +1,92 @@
+# TODO
+
+## Core Proxy
+
+- Replace full request buffering with streamed forwarding through the Pingora
+  downstream and upstream sessions.
+- Implement true MITM TLS handling so HTTPS request/response headers and bodies
+  can be inspected and modified.
+- Make HTTP/2 proxying first-class for both client-facing and upstream traffic.
+- Decide how to handle HTTP/3. Pingora 0.8 in this repo does not expose a QUIC
+  or HTTP/3 listener API.
+- Add WebSocket upgrade handling and frame inspection on the Pingora path.
+- Add container egress enforcement:
+  - entrypoint script or supervisor for iptables setup
+  - rules that limit monitored-container egress to the proxy daemon
+  - Docker Compose isolated network example
+- Add integration tests that exercise the proxy with real HTTP clients and
+  upstream test servers.
+
+## Plugin Runtime
+
+- Add response header hooks:
+  - `onResponseHeaders`
+- Add request body hooks:
+  - `onRequestBodyChunk`
+  - `onRequestBodyEnd`
+- Add response body hooks:
+  - `onResponseBodyChunk`
+  - `onResponseBodyEnd`
+- Replace full body buffering with streaming request/response handling.
+- Implement body hook actions:
+  - `continue`
+  - `replace`
+  - `drop`
+  - `deny`
+  - `respond`
+- Add `HookContext.metadata` with per-request state shared across hook phases.
+- Populate `HookContext.matchedRule` where plugin execution is tied to a rule.
+- Expand `plugins/proxy.d.ts` to cover the full plugin interface from
+  `PLAN.md`.
+
+## Plugin Results
+
+- Implement synthetic `respond` as distinct from `deny`.
+- Support response headers on `deny` and `respond` results.
+- Support `Uint8Array` response bodies.
+- Implement `RedactedValue` and `reveal()`.
+- Decide whether `RouteResult.addHeaders` is a supported extension or should be
+  removed to match `PLAN.md`.
+- Add tests for route behavior, including path/query preservation and explicit
+  upstream paths.
+
+## Secrets And Audit
+
+- Avoid materializing all configured secrets into V8 on every plugin call.
+- Make `proxy.secrets.get()`, `SecretValue.text()`, and `SecretValue.bearer()`
+  true host-backed async operations.
+- Preserve arbitrary audit `fields` in the host audit log.
+- Ensure secret access is audited without logging secret values.
+- Add redaction tests for logs and error paths.
+
+## V8 And Esbuild
+
+- Cache esbuild bundle output instead of bundling every plugin at startup.
+- Cache compiled plugin state or isolates where safe.
+- Add plugin execution limits:
+  - timeout
+  - memory limit
+  - maximum bundle size
+  - maximum audit event count per hook
+- Improve plugin compile/load errors with plugin name, path, and source
+  location where available.
+- Add tests for skipped plugins when `esbuild` is missing or bundling fails.
+- Add examples for plain JavaScript and TypeScript plugin authoring.
+
+## Configuration
+
+- Document the complete `config.toml` schema.
+- Add validation for duplicate rule/plugin names.
+- Add validation for invalid header names and unreachable plugin paths.
+- Add configurable plugin behavior on load failure:
+  - warn and skip
+  - fail startup
+- Add config examples for common AI API providers.
+
+## Packaging
+
+- Ensure the runtime image includes or documents `esbuild`.
+- Add a production entrypoint that initializes networking before starting
+  Stalin.
+- Add healthcheck endpoint or command.
+- Add release build instructions.

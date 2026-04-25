@@ -12,8 +12,7 @@ struct Args {
     config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     fmt()
@@ -25,5 +24,5 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_path(&args.config)
         .with_context(|| format!("failed to load config {}", args.config.display()))?;
-    ProxyServer::new(config).serve().await
+    ProxyServer::new(config).serve()
 }

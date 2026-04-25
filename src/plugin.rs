@@ -245,7 +245,7 @@ impl RequestHeadersPayload {
             id: req.request_id.clone(),
             method: req.method.as_str().to_string(),
             url: UrlPayload::new(&req.url),
-            protocol: "http/1.1",
+            protocol: req.protocol,
             header_entries: headers
                 .iter()
                 .filter_map(|(name, value)| {
@@ -654,7 +654,7 @@ export default plugin;
                     env: "STALIN_TEST_TOKEN".to_string(),
                 },
             )])),
-            AuditLog::new(None).await.unwrap(),
+            AuditLog::new(None).unwrap(),
         )
         .unwrap()
         .unwrap();
