@@ -8,7 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
-    #[arg(short, long, env = "STALIN_CONFIG", default_value = "stalin.yml")]
+    #[arg(short, long, env = "STALIN_CONFIG", default_value = "config.toml")]
     config: PathBuf,
 }
 

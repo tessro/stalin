@@ -27,7 +27,7 @@ impl Default for Config {
 impl Config {
     pub fn from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        Ok(serde_yaml::from_str(&raw)?)
+        Ok(toml::from_str(&raw)?)
     }
 }
 
@@ -99,23 +99,24 @@ mod tests {
 
     #[test]
     fn parses_example_shape() {
-        let cfg: Config = serde_yaml::from_str(
+        let cfg: Config = toml::from_str(
             r#"
-listen: 127.0.0.1:8080
-secrets:
-  openai_api_key:
-    env: OPENAI_API_KEY
-rules:
-  - name: openai
-    match:
-      host: api.openai.com
-    request_headers:
-      set:
-        authorization:
-          secret: openai_api_key
-          format: "Bearer {value}"
-      remove:
-        - x-placeholder-authorization
+listen = "127.0.0.1:8080"
+
+[secrets.openai_api_key]
+env = "OPENAI_API_KEY"
+
+[[rules]]
+name = "openai"
+
+[rules.match]
+host = "api.openai.com"
+
+[rules.request_headers.set]
+authorization = { secret = "openai_api_key", format = "Bearer {value}" }
+
+[rules.request_headers]
+remove = ["x-placeholder-authorization"]
 "#,
         )
         .unwrap();

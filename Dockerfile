@@ -9,7 +9,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/stalin /usr/local/bin/stalin
-COPY examples/stalin.yml /etc/stalin/stalin.yml
-ENV STALIN_CONFIG=/etc/stalin/stalin.yml
+COPY examples/stalin.toml /etc/stalin/config.toml
+ENV STALIN_CONFIG=/etc/stalin/config.toml
 EXPOSE 8080
 ENTRYPOINT ["stalin"]

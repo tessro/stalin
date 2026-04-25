@@ -21,7 +21,7 @@ reworking proxy request handling.
 ## Run
 
 ```sh
-cargo run -- --config examples/stalin.yml
+cargo run -- --config examples/stalin.toml
 ```
 
 Then point a client at the proxy:
@@ -33,7 +33,7 @@ HTTPS_PROXY=http://127.0.0.1:8080 curl https://example.com/
 
 ## Configuration
 
-See [examples/stalin.yml](examples/stalin.yml).
+See [examples/stalin.toml](examples/stalin.toml).
 
 Rules are evaluated in order. A matching `deny` stops the request. Header
 patches apply only to inspectable HTTP requests; `CONNECT` requests are
