@@ -9,6 +9,8 @@ export interface ProxyRuntime {
   readonly audit: AuditLog;
   readonly crypto: CryptoApi;
   readonly clock: ClockApi;
+  readonly session: SessionStore;
+  fetch(input: string, init?: FetchInit): Promise<FetchResponse> | FetchResponse;
 }
 
 export interface PluginInfo {
@@ -25,6 +27,28 @@ export interface SecretValue {
   readonly name: string;
   text(): Promise<string>;
   bearer(): Promise<string>;
+}
+
+export interface SessionStore {
+  get(key: string): JsonValue | undefined;
+  set(key: string, value: JsonValue): void;
+  delete(key: string): boolean;
+  clear(): void;
+}
+
+export interface FetchInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+export interface FetchResponse {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly statusText: string;
+  readonly headers: HeadersView;
+  text(): Promise<string> | string;
+  json(): Promise<JsonValue> | JsonValue;
 }
 
 export interface AuditLog {

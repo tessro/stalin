@@ -1,0 +1,24 @@
+listen = "0.0.0.0:8080"
+audit_log = "/tmp/stalin-audit.jsonl"
+
+[mitm]
+enabled = true
+ca_cert = "/srv/cacert.pem"
+ca_key = "/srv/cakey.pem"
+
+[[rules]]
+name = "google-workspace-auth"
+audit = true
+
+[rules.match]
+scheme = "https"
+host = "*.googleapis.com"
+
+[rules.request_headers.set.authorization]
+format = "Bearer {value}"
+
+[rules.request_headers.set.authorization.oauth_refresh_token]
+token_url = "https://oauth2.googleapis.com/token"
+client_id_env = "GOOGLE_WORKSPACE_CLIENT_ID"
+client_secret_env = "GOOGLE_WORKSPACE_CLIENT_SECRET"
+refresh_token_env = "GOOGLE_WORKSPACE_REFRESH_TOKEN"

@@ -1,4 +1,10 @@
-use std::{convert::TryFrom, path::PathBuf, process::Command, sync::Once};
+use std::{
+    collections::HashMap,
+    convert::TryFrom,
+    path::PathBuf,
+    process::Command,
+    sync::{LazyLock, Mutex, Once},
+};
 
 use anyhow::{Context, anyhow};
 use http::HeaderMap;
@@ -18,6 +24,26 @@ use crate::{
 };
 
 static V8_INIT: Once = Once::new();
+static HOST_STATE: LazyLock<HostState> = LazyLock::new(HostState::new);
+
+struct HostState {
+    session: Mutex<HashMap<String, Value>>,
+    http: reqwest::blocking::Client,
+}
+
+impl HostState {
+    fn new() -> Self {
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("plugin host HTTP client can be built");
+        Self {
+            session: Mutex::new(HashMap::new()),
+            http,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PluginRuntime {
@@ -842,6 +868,21 @@ fn install_host_functions(scope: &mut v8::PinScope) {
     let global = scope.get_current_context().global(scope);
     set_function(scope, global, "__stalinSha256", sha256_callback);
     set_function(scope, global, "__stalinRandomUUID", random_uuid_callback);
+    set_function(scope, global, "__stalinSessionGet", session_get_callback);
+    set_function(scope, global, "__stalinSessionSet", session_set_callback);
+    set_function(
+        scope,
+        global,
+        "__stalinSessionDelete",
+        session_delete_callback,
+    );
+    set_function(
+        scope,
+        global,
+        "__stalinSessionClear",
+        session_clear_callback,
+    );
+    set_function(scope, global, "__stalinFetch", fetch_callback);
 }
 
 fn set_function(
@@ -880,6 +921,209 @@ fn random_uuid_callback(
     let uuid = Uuid::new_v4().to_string();
     let value = v8::String::new(scope, &uuid).expect("UUID is valid UTF-8");
     retval.set(value.into());
+}
+
+fn session_get_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let key = session_key(scope, &args, 0, 1);
+    let Some(value) = HOST_STATE
+        .session
+        .lock()
+        .expect("session store lock is not poisoned")
+        .get(&key)
+        .cloned()
+    else {
+        retval.set(v8::undefined(scope).into());
+        return;
+    };
+
+    if let Some(value) = json_to_v8(scope, &value) {
+        retval.set(value);
+    }
+}
+
+fn session_set_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let key = session_key(scope, &args, 0, 1);
+    let value = args.get(2);
+    let Some(value) = v8_to_json(scope, value) else {
+        throw_type_error(scope, "session value is not JSON serializable");
+        return;
+    };
+    HOST_STATE
+        .session
+        .lock()
+        .expect("session store lock is not poisoned")
+        .insert(key, value);
+}
+
+fn session_delete_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let key = session_key(scope, &args, 0, 1);
+    let removed = HOST_STATE
+        .session
+        .lock()
+        .expect("session store lock is not poisoned")
+        .remove(&key)
+        .is_some();
+    retval.set(v8::Boolean::new(scope, removed).into());
+}
+
+fn session_clear_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let namespace = argument_string(scope, &args, 0);
+    let prefix = format!("{namespace}\0");
+    HOST_STATE
+        .session
+        .lock()
+        .expect("session store lock is not poisoned")
+        .retain(|key, _| !key.starts_with(&prefix));
+}
+
+fn fetch_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let raw = argument_string(scope, &args, 0);
+    let payload = match serde_json::from_str::<FetchPayload>(&raw) {
+        Ok(payload) => payload,
+        Err(err) => {
+            throw_type_error(scope, &format!("invalid fetch payload: {err}"));
+            return;
+        }
+    };
+    let response = match plugin_fetch(payload) {
+        Ok(response) => response,
+        Err(err) => {
+            throw_type_error(scope, &format!("fetch failed: {err}"));
+            return;
+        }
+    };
+    if let Some(value) = json_to_v8(
+        scope,
+        &serde_json::to_value(response).unwrap_or(Value::Null),
+    ) {
+        retval.set(value);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchPayload {
+    input: String,
+    #[serde(default)]
+    init: FetchInit,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchInit {
+    method: Option<String>,
+    headers: Option<HashMap<String, String>>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchOutput {
+    ok: bool,
+    status: u16,
+    status_text: String,
+    headers: Vec<(String, String)>,
+    text: String,
+}
+
+fn plugin_fetch(payload: FetchPayload) -> anyhow::Result<FetchOutput> {
+    let method = payload
+        .init
+        .method
+        .unwrap_or_else(|| "GET".to_string())
+        .parse()?;
+    let mut request = HOST_STATE.http.request(method, payload.input);
+    if let Some(headers) = payload.init.headers {
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+    }
+    if let Some(body) = payload.init.body {
+        request = request.body(body);
+    }
+
+    let response = request.send()?;
+    let status = response.status();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let text = response.text()?;
+
+    Ok(FetchOutput {
+        ok: status.is_success(),
+        status: status.as_u16(),
+        status_text: status.canonical_reason().unwrap_or("").to_string(),
+        headers,
+        text,
+    })
+}
+
+fn argument_string(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    index: i32,
+) -> String {
+    args.get(index)
+        .to_string(scope)
+        .map(|value| value.to_rust_string_lossy(scope))
+        .unwrap_or_default()
+}
+
+fn session_key(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    namespace_index: i32,
+    key_index: i32,
+) -> String {
+    let namespace = argument_string(scope, args, namespace_index);
+    let key = argument_string(scope, args, key_index);
+    format!("{namespace}\0{key}")
+}
+
+fn v8_to_json(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Option<Value> {
+    let json = v8::json::stringify(scope, value)?;
+    serde_json::from_str(&json.to_rust_string_lossy(scope)).ok()
+}
+
+fn json_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: &Value,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let raw = serde_json::to_string(value).ok()?;
+    let raw = v8::String::new(scope, &raw)?;
+    v8::json::parse(scope, raw)
+}
+
+fn throw_type_error(scope: &mut v8::PinScope, message: &str) {
+    let message = v8::String::new(scope, message).expect("error message is valid UTF-8");
+    let exception = v8::Exception::type_error(scope, message);
+    scope.throw_exception(exception);
 }
 
 fn run_script<'s>(
@@ -967,6 +1211,23 @@ function __stalinSecretValue(name) {{
   }};
 }}
 
+function __stalinFetchResponse(raw) {{
+  return Object.freeze({{
+    ok: Boolean(raw.ok),
+    status: Number(raw.status),
+    statusText: String(raw.statusText ?? ""),
+    headers: __stalinHeaders(raw.headers ?? []),
+    text() {{
+      return String(raw.text ?? "");
+    }},
+    json() {{
+      return JSON.parse(String(raw.text ?? ""));
+    }},
+  }});
+}}
+
+const __stalinSessionNamespace = `${{__stalinPluginInfo.name}}@${{__stalinPluginInfo.version}}`;
+
 globalThis.proxy = Object.freeze({{
   plugin: Object.freeze(__stalinPluginInfo),
   secrets: Object.freeze({{
@@ -974,6 +1235,27 @@ globalThis.proxy = Object.freeze({{
       return __stalinSecretValue(String(name));
     }},
   }}),
+  session: Object.freeze({{
+    get(key) {{
+      return globalThis.__stalinSessionGet(__stalinSessionNamespace, String(key));
+    }},
+    set(key, value) {{
+      globalThis.__stalinSessionSet(__stalinSessionNamespace, String(key), value);
+    }},
+    delete(key) {{
+      return globalThis.__stalinSessionDelete(__stalinSessionNamespace, String(key));
+    }},
+    clear() {{
+      globalThis.__stalinSessionClear(__stalinSessionNamespace);
+    }},
+  }}),
+  fetch(input, init = {{}}) {{
+    const raw = globalThis.__stalinFetch(JSON.stringify({{
+      input: String(input),
+      init,
+    }}));
+    return __stalinFetchResponse(raw);
+  }},
   audit: Object.freeze({{
     write(event) {{
       globalThis.__stalinAuditEvents.push(event ?? {{ type: "plugin.audit" }});
@@ -1165,6 +1447,11 @@ fn bundle_plugin_source(config: &PluginConfig) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{audit::AuditLog, config::PluginConfig};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     #[tokio::test]
     async fn plugin_can_patch_headers_and_use_secret() {
@@ -1225,6 +1512,132 @@ export default plugin;
                     set_headers["x-plugin"],
                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
                 );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_session_persists_across_invocations() {
+        let file = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+const plugin = {
+  onRequestHeaders() {
+    const count = Number(proxy.session.get("count") ?? 0) + 1;
+    proxy.session.set("count", count);
+    return {
+      action: "continue",
+      setHeaders: { "x-count": String(count) },
+    };
+  },
+};
+export default plugin;
+"#,
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            vec![PluginConfig {
+                name: format!("test-{}", Uuid::new_v4()),
+                version: "0.1.0".to_string(),
+                path: file.path().to_path_buf(),
+                config: None,
+            }],
+            SecretStore::new(std::collections::HashMap::new()),
+            AuditLog::new(None).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let req = RequestInfo::new(
+            http::Method::GET,
+            Url::parse("https://api.example.com/v1").unwrap(),
+        );
+        let headers = HeaderMap::new();
+
+        let first = runtime.on_request_headers(&req, &headers).await.unwrap();
+        let second = runtime.on_request_headers(&req, &headers).await.unwrap();
+
+        match &first[0].result {
+            PluginResult::Continue { set_headers, .. } => {
+                assert_eq!(set_headers["x-count"], "1");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        match &second[0].result {
+            PluginResult::Continue { set_headers, .. } => {
+                assert_eq!(set_headers["x-count"], "2");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_can_fetch_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello",
+                )
+                .unwrap();
+        });
+
+        let file = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                r#"
+const plugin = {{
+  async onRequestHeaders() {{
+    const res = await proxy.fetch({url:?}, {{
+      method: "POST",
+      headers: {{ "content-type": "text/plain" }},
+      body: "ping",
+    }});
+    const body = await res.text();
+    return {{
+      action: "continue",
+      setHeaders: {{
+        "x-fetch-status": String(res.status),
+        "x-fetch-body": body,
+      }},
+    }};
+  }},
+}};
+export default plugin;
+"#
+            ),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            vec![PluginConfig {
+                name: "test".to_string(),
+                version: "0.1.0".to_string(),
+                path: file.path().to_path_buf(),
+                config: None,
+            }],
+            SecretStore::new(std::collections::HashMap::new()),
+            AuditLog::new(None).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let req = RequestInfo::new(
+            http::Method::GET,
+            Url::parse("https://api.example.com/v1").unwrap(),
+        );
+        let headers = HeaderMap::new();
+        let outcomes = runtime.on_request_headers(&req, &headers).await.unwrap();
+        server.join().unwrap();
+
+        match &outcomes[0].result {
+            PluginResult::Continue { set_headers, .. } => {
+                assert_eq!(set_headers["x-fetch-status"], "200");
+                assert_eq!(set_headers["x-fetch-body"], "hello");
             }
             other => panic!("unexpected result: {other:?}"),
         }

@@ -1,0 +1,21 @@
+listen = "0.0.0.0:8080"
+audit_log = "/tmp/stalin-audit.jsonl"
+
+[mitm]
+enabled = true
+ca_cert = "/srv/cacert.pem"
+ca_key = "/srv/cakey.pem"
+
+[secrets.google_workspace_client_id]
+env = "GOOGLE_WORKSPACE_CLIENT_ID"
+
+[secrets.google_workspace_client_secret]
+env = "GOOGLE_WORKSPACE_CLIENT_SECRET"
+
+[secrets.google_workspace_refresh_token]
+env = "GOOGLE_WORKSPACE_REFRESH_TOKEN"
+
+[[plugins]]
+name = "google-workspace-auth"
+version = "0.1.0"
+path = "google-workspace-auth.plugin.ts"

@@ -64,10 +64,14 @@ Authorization: Bearer <real key>
 
 The key comes from the proxy process, not the monitored container.
 
-## Google Workspace Auth Rewrite
+## OAuth Refresh Token Management
 
-Stalin can refresh OAuth access tokens in-process for Google Workspace traffic.
-Set these in the proxy process:
+Stalin can refresh OAuth access tokens in-process and inject the current access
+token into matching requests. The monitored container can keep a dummy token;
+Stalin uses the refresh token held by the proxy process and caches the resulting
+access token until shortly before expiry.
+
+For example, to proxy Google Workspace traffic, set these in the proxy process:
 
 ```sh
 GOOGLE_WORKSPACE_CLIENT_ID=...
@@ -75,7 +79,8 @@ GOOGLE_WORKSPACE_CLIENT_SECRET=...
 GOOGLE_WORKSPACE_REFRESH_TOKEN=...
 ```
 
-Then configure a Google APIs rule:
+Then configure a Google APIs rule that sets the `Authorization` header from a
+refreshed token:
 
 ```toml
 [[rules]]
@@ -95,8 +100,12 @@ client_secret_env = "GOOGLE_WORKSPACE_CLIENT_SECRET"
 refresh_token_env = "GOOGLE_WORKSPACE_REFRESH_TOKEN"
 ```
 
-The monitored container can keep a dummy token. Stalin refreshes and caches the
-real access token until shortly before expiry.
+For a complete minimal native config, see
+`examples/google-workspace-oauth-refresh.toml`.
+
+The same flow can also be written as a V8 plugin with `proxy.fetch` and
+plugin-scoped `proxy.session`; see `examples/google-workspace-auth.plugin.ts`
+and `examples/google-workspace-v8.toml`.
 
 ## Config
 
