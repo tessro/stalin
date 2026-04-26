@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, Method, StatusCode, Uri, Version};
+use http::{HeaderMap, Method, StatusCode, Version};
 use pingora::{
     apps::{HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream},
     connectors::http::Connector,
@@ -29,7 +29,7 @@ use tokio::{
     net::{TcpStream, lookup_host},
 };
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
@@ -141,19 +141,21 @@ impl HttpServerApp for StalinPingoraApp {
 
 impl StalinPingoraApp {
     async fn handle_request(&self, http: &mut ServerSession) -> Result<(), ProxyError> {
-        self.handle_request_with_default_scheme(http, "http").await
+        self.handle_request_with_default_scheme(http, "http", UpstreamVersion::Http2Preferred)
+            .await
     }
 
     async fn handle_request_with_default_scheme(
         &self,
         http: &mut ServerSession,
         default_scheme: &str,
+        upstream_version: UpstreamVersion,
     ) -> Result<(), ProxyError> {
         let (method, mut target, protocol, mut outbound_headers) = {
             let req = http.req_header();
             (
                 req.method.clone(),
-                target_url_with_default_scheme(&req.uri, &req.headers, default_scheme)?,
+                target_url_from_request(req, default_scheme)?,
                 protocol_name(req.version),
                 sanitized_headers(&req.headers),
             )
@@ -187,11 +189,16 @@ impl StalinPingoraApp {
             }
         }
 
-        let peer = upstream_peer(&target).await?;
+        let peer = upstream_peer_with_version(&target, upstream_version).await?;
         let mut upstream_req = upstream_request(method, &target, &outbound_headers)?;
         set_host_header(&mut upstream_req, &target)?;
 
         let (mut upstream, _) = self.connector.get_http_session(&peer).await?;
+        debug!(
+            url = %target,
+            upstream = upstream_session_name(&upstream),
+            "forwarding request upstream"
+        );
         upstream
             .write_request_header(Box::new(upstream_req))
             .await?;
@@ -212,13 +219,11 @@ impl StalinPingoraApp {
     ) -> Result<Option<ServerSession>, ProxyError> {
         let (authority, cert_host, target, protocol, mut headers) = {
             let req = http.req_header();
-            let authority = req.uri.authority().ok_or_else(|| {
-                ProxyError::BadRequest("CONNECT request missing authority".to_string())
-            })?;
+            let (authority, target, cert_host) = connect_target(req)?;
             (
-                authority.to_string(),
-                authority.host().to_string(),
-                connect_target_url(&req.uri, authority.as_str())?,
+                authority,
+                cert_host,
+                target,
                 protocol_name(req.version),
                 sanitized_headers(&req.headers),
             )
@@ -390,7 +395,7 @@ impl StalinPingoraApp {
             self.handle_upgrade_with_default_scheme(http, "https").await
         } else {
             match self
-                .handle_request_with_default_scheme(&mut http, "https")
+                .handle_request_with_default_scheme(&mut http, "https", UpstreamVersion::Http1)
                 .await
             {
                 Ok(()) => Ok(Some(http)),
@@ -429,7 +434,7 @@ impl StalinPingoraApp {
             let req = http.req_header();
             (
                 req.method.clone(),
-                target_url_with_default_scheme(&req.uri, &req.headers, default_scheme)?,
+                target_url_from_request(req, default_scheme)?,
                 protocol_name(req.version),
                 sanitized_upgrade_headers(&req.headers),
             )
@@ -752,10 +757,6 @@ fn should_skip_upgrade_response_header(name: &http::HeaderName) -> bool {
     name.as_str().eq_ignore_ascii_case("transfer-encoding")
 }
 
-async fn upstream_peer(target: &Url) -> Result<HttpPeer, ProxyError> {
-    upstream_peer_with_version(target, UpstreamVersion::Http2Preferred).await
-}
-
 #[derive(Debug, Clone, Copy)]
 enum UpstreamVersion {
     Http1,
@@ -828,11 +829,89 @@ fn protocol_name(version: Version) -> &'static str {
     }
 }
 
-fn connect_target_url(uri: &Uri, authority: &str) -> anyhow::Result<Url> {
-    if uri.scheme().is_some() {
-        return Ok(Url::parse(&uri.to_string())?);
+fn target_url_from_request(req: &RequestHeader, default_scheme: &str) -> Result<Url, ProxyError> {
+    if req.uri.scheme().is_some() {
+        return target_url_with_default_scheme(&req.uri, &req.headers, default_scheme)
+            .map_err(ProxyError::BadGateway);
     }
-    Ok(Url::parse(&format!("https://{authority}/"))?)
+
+    let raw_target = std::str::from_utf8(req.raw_path()).ok();
+    if let Some(raw_target) = raw_target {
+        let raw_target = raw_target.trim_start_matches('/');
+        if raw_target.starts_with("http://") || raw_target.starts_with("https://") {
+            return Url::parse(raw_target).map_err(|err| {
+                ProxyError::BadRequest(format!("invalid absolute-form request target: {err}"))
+            });
+        }
+    }
+
+    target_url_with_default_scheme(&req.uri, &req.headers, default_scheme)
+        .map_err(ProxyError::BadGateway)
+}
+
+fn upstream_session_name(upstream: &UpstreamHttpSession) -> &'static str {
+    match upstream {
+        UpstreamHttpSession::H1(_) => "http/1.1",
+        UpstreamHttpSession::H2(_) => "h2",
+        UpstreamHttpSession::Custom(_) => "custom",
+    }
+}
+
+fn connect_target(req: &RequestHeader) -> Result<(String, Url, String), ProxyError> {
+    if req.uri.scheme().is_some() {
+        let target = Url::parse(&req.uri.to_string())
+            .map_err(|err| ProxyError::BadRequest(format!("invalid CONNECT target URL: {err}")))?;
+        let host = target
+            .host_str()
+            .ok_or_else(|| {
+                ProxyError::BadRequest("CONNECT target URL is missing a host".to_string())
+            })?
+            .to_string();
+        let authority = authority_from_url(&target)?;
+        return Ok((authority, target, host));
+    }
+
+    let authority = connect_authority(req)?;
+    let target = Url::parse(&format!("https://{authority}/"))
+        .map_err(|err| ProxyError::BadRequest(format!("invalid CONNECT authority: {err}")))?;
+    let host = target
+        .host_str()
+        .ok_or_else(|| ProxyError::BadRequest("CONNECT target is missing a host".to_string()))?
+        .to_string();
+    Ok((authority, target, host))
+}
+
+fn connect_authority(req: &RequestHeader) -> Result<String, ProxyError> {
+    if let Some(authority) = req.uri.authority() {
+        return Ok(authority.as_str().to_string());
+    }
+
+    let raw = std::str::from_utf8(req.raw_path())
+        .map_err(|_| ProxyError::BadRequest("CONNECT target is not valid UTF-8".to_string()))?;
+    let authority = raw.trim().trim_start_matches('/');
+    if authority.is_empty() {
+        return Err(ProxyError::BadRequest(
+            "CONNECT request missing authority".to_string(),
+        ));
+    }
+    if authority.contains("://") {
+        let target = Url::parse(authority)
+            .map_err(|err| ProxyError::BadRequest(format!("invalid CONNECT target URL: {err}")))?;
+        return authority_from_url(&target);
+    }
+    Ok(authority.to_string())
+}
+
+fn authority_from_url(target: &Url) -> Result<String, ProxyError> {
+    let host = target.host_str().ok_or_else(|| {
+        ProxyError::BadRequest("CONNECT target URL is missing a host".to_string())
+    })?;
+    match target.port_or_known_default() {
+        Some(port) => Ok(format!("{host}:{port}")),
+        None => Err(ProxyError::BadRequest(
+            "CONNECT target URL is missing a port".to_string(),
+        )),
+    }
 }
 
 fn routed_url(mut upstream: Url, original: &Url) -> Url {
@@ -906,6 +985,16 @@ mod tests {
     }
 
     #[test]
+    fn target_url_from_request_supports_absolute_form_raw_path() {
+        let request =
+            RequestHeader::build(Method::GET, b"http://example.com/v1?a=b", None).unwrap();
+
+        let target = target_url_from_request(&request, "http").unwrap();
+
+        assert_eq!(target.as_str(), "http://example.com/v1?a=b");
+    }
+
+    #[test]
     fn host_header_includes_explicit_port() {
         let target = Url::parse("http://example.com:8080/").unwrap();
         let mut request = upstream_request(Method::GET, &target, &HeaderMap::new()).unwrap();
@@ -916,5 +1005,28 @@ mod tests {
             request.headers.get(http::header::HOST).unwrap(),
             HeaderValue::from_static("example.com:8080")
         );
+    }
+
+    #[test]
+    fn connect_target_supports_authority_form_raw_path() {
+        let request = RequestHeader::build(Method::CONNECT, b"api.openai.com:443", None).unwrap();
+
+        let (authority, target, cert_host) = connect_target(&request).unwrap();
+
+        assert_eq!(authority, "api.openai.com:443");
+        assert_eq!(target.as_str(), "https://api.openai.com/");
+        assert_eq!(cert_host, "api.openai.com");
+    }
+
+    #[test]
+    fn connect_target_supports_absolute_form_url() {
+        let request =
+            RequestHeader::build(Method::CONNECT, b"https://api.openai.com:443", None).unwrap();
+
+        let (authority, target, cert_host) = connect_target(&request).unwrap();
+
+        assert_eq!(authority, "api.openai.com:443");
+        assert_eq!(target.as_str(), "https://api.openai.com/");
+        assert_eq!(cert_host, "api.openai.com");
     }
 }

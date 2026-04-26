@@ -35,6 +35,45 @@ HTTP_PROXY=http://127.0.0.1:8080 curl http://example.com/
 HTTPS_PROXY=http://127.0.0.1:8080 curl https://example.com/
 ```
 
+## Docker MITM Trial
+
+Generate a local CA for the proxy. The private key stays mounted only in the
+proxy container; the monitored container receives only the public CA
+certificate.
+
+```sh
+mkdir -p certs
+openssl genrsa -out certs/stalin-ca-key.pem 4096
+openssl req -x509 -new -nodes \
+  -key certs/stalin-ca-key.pem \
+  -sha256 -days 365 \
+  -subj "/CN=stalin local MITM CA" \
+  -out certs/stalin-ca.pem
+```
+
+Start the proxy and monitored test container:
+
+```sh
+docker compose up --build
+```
+
+Then test from the monitored container:
+
+```sh
+docker compose exec agent curl https://api.openai.com/
+```
+
+The proxy container sees the CA material at `/srv/cacert.pem` and
+`/srv/cakey.pem`, plus the real `OPENAI_API_KEY` from the host environment. The
+monitored `agent` container sees only `/srv/cacert.pem` and a harmless
+placeholder `OPENAI_API_KEY`; its entrypoint installs the CA certificate into
+Debian's system trust store and sets common CA bundle environment variables for
+runtimes that do not use the system defaults.
+
+The compose MITM config loads `examples/openai-auth.plugin.ts`. That plugin runs
+inside the proxy and replaces requests to `api.openai.com` with
+`Authorization: Bearer <real key>` before forwarding upstream.
+
 ## Configuration
 
 See [examples/stalin.toml](examples/stalin.toml).

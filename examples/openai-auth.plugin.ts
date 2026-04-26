@@ -18,7 +18,7 @@ const plugin: ProxyPlugin = {
     return {
       action: "continue",
       setHeaders: {
-        authorization: await proxy.secrets.get("openai_api_key"),
+        authorization: (await proxy.secrets.get("openai_api_key")).bearer(),
       },
       removeHeaders: ["x-placeholder-authorization"],
     };

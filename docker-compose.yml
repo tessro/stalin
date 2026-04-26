@@ -5,16 +5,54 @@ services:
       - NET_ADMIN
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY}
-      STALIN_CONFIG: /etc/stalin/config.toml
+      STALIN_CONFIG: /etc/stalin/stalin-mitm.toml
     ports:
       - "8080:8080"
+    volumes:
+      - type: bind
+        source: ./examples/stalin-mitm.toml
+        target: /etc/stalin/stalin-mitm.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./certs/stalin-ca.pem
+        target: /srv/cacert.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./certs/stalin-ca-key.pem
+        target: /srv/cakey.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./examples/openai-auth.plugin.ts
+        target: /etc/stalin/openai-auth.plugin.ts
+        read_only: true
+        bind:
+          create_host_path: false
 
   agent:
-    image: curlimages/curl:8.11.0
+    build:
+      context: .
+      dockerfile: docker/monitored.Dockerfile
     command: ["sleep", "infinity"]
     environment:
       HTTP_PROXY: http://proxy:8080
       HTTPS_PROXY: http://proxy:8080
       NO_PROXY: localhost,127.0.0.1
+      OPENAI_API_KEY: stalin-placeholder
+      NODE_EXTRA_CA_CERTS: /srv/cacert.pem
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - type: bind
+        source: ./certs/stalin-ca.pem
+        target: /srv/cacert.pem
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       - proxy

@@ -271,8 +271,8 @@ pub fn target_url_with_default_scheme(
     headers: &HeaderMap,
     default_scheme: &str,
 ) -> anyhow::Result<Url> {
-    if uri.scheme().is_some() && uri.authority().is_some() {
-        return Ok(Url::parse(&uri.to_string())?);
+    if uri.scheme().is_some() {
+        return Ok(Url::parse(uri.to_string().trim_start_matches('/'))?);
     }
 
     let host = headers
@@ -303,6 +303,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
         let url = target_url(&"/v1?a=b".parse().unwrap(), &headers).unwrap();
+        assert_eq!(url.as_str(), "http://example.com/v1?a=b");
+    }
+
+    #[test]
+    fn target_url_supports_absolute_form() {
+        let headers = HeaderMap::new();
+        let url = target_url(&"http://example.com/v1?a=b".parse().unwrap(), &headers).unwrap();
         assert_eq!(url.as_str(), "http://example.com/v1?a=b");
     }
 

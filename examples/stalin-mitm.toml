@@ -1,0 +1,33 @@
+listen = "0.0.0.0:8080"
+audit_log = "/tmp/stalin-audit.jsonl"
+
+[mitm]
+enabled = true
+ca_cert = "/srv/cacert.pem"
+ca_key = "/srv/cakey.pem"
+
+[secrets.openai_api_key]
+env = "OPENAI_API_KEY"
+
+[[plugins]]
+name = "openai-auth"
+version = "0.1.0"
+path = "openai-auth.plugin.ts"
+
+[[rules]]
+name = "block-instance-metadata"
+audit = true
+
+[rules.match]
+host = "169.254.169.254"
+
+[rules.deny]
+status = 403
+body = "metadata service access is blocked\n"
+
+[[rules]]
+name = "openai"
+audit = true
+
+[rules.match]
+host = "api.openai.com"
