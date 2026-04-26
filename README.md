@@ -1,26 +1,16 @@
 # Stalin
 
-Stalin is a Rust egress proxy for agent containers. It keeps credentials and
-egress policy outside the monitored container, rewrites outbound HTTP headers,
-audits requests, and can block traffic by request shape.
+Stalin is a programmable HTTP/2 TLS MITM proxy, designed to surveil, block, and modify agent network egress. A surveillance state for AI, if you will.
 
-This repository currently contains the first working implementation:
+## What Stalin Can Do
 
-- Pingora-owned downstream and upstream proxy path with HTTP/1.1 and HTTP/2
-  session handling.
-- Explicit HTTP proxying for absolute-form `HTTP_PROXY` requests.
-- HTTPS `CONNECT` tunneling with host-level allow, deny, and audit decisions.
-- Optional HTTP/1.1 and HTTP/2 MITM TLS interception for CONNECT requests when
-  configured with a trusted local CA.
-- HTTP/1.1 upgrade tunneling for WebSocket-style proxy traffic.
-- Rule-driven request header mutation.
-- V8 request-header plugins with secret, audit, crypto, and clock host APIs.
-- Secret-backed header values from environment variables.
-- JSONL audit logging.
-- Docker and Compose examples for sidecar deployment.
+Stalin sees all outbound HTTP(S) traffic. (Yes, including TLS.) It provides a
+flexible V8-based plugin architecture upon which you can do many things to
+protect your personal data and keep your agents secure:
 
-Deep body inspection and streaming body hooks described in `PLAN.md` are
-intentionally isolated as follow-on work.
+- Replace dummy API keys with their actual values, keeping keys out of agent containers.
+- Log or block outbound traffic based on arbitrary rules.
+- Make out-of-band network requests, e.g. to back up data an agent is about to modify or delete.
 
 ## Run
 
@@ -28,18 +18,16 @@ intentionally isolated as follow-on work.
 cargo run -- --config examples/stalin.toml
 ```
 
-Then point a client at the proxy:
+Point a client at it:
 
 ```sh
 HTTP_PROXY=http://127.0.0.1:8080 curl http://example.com/
 HTTPS_PROXY=http://127.0.0.1:8080 curl https://example.com/
 ```
 
-## Docker MITM Trial
+## Docker MITM
 
-Generate a local CA for the proxy. The private key stays mounted only in the
-proxy container; the monitored container receives only the public CA
-certificate.
+Generate a local CA:
 
 ```sh
 mkdir -p certs
@@ -51,37 +39,59 @@ openssl req -x509 -new -nodes \
   -out certs/stalin-ca.pem
 ```
 
-Start the proxy and monitored test container:
+Start the proxy and monitored container:
 
 ```sh
-docker compose up --build
+OPENAI_API_KEY="$OPENAI_API_KEY" docker compose up --build
 ```
 
-Then test from the monitored container:
+Test from the monitored container:
 
 ```sh
-docker compose exec agent curl https://api.openai.com/
+docker compose exec agent curl -v https://api.openai.com/
 ```
 
-The proxy container sees the CA material at `/srv/cacert.pem` and
-`/srv/cakey.pem`, plus the real `OPENAI_API_KEY` from the host environment. The
-monitored `agent` container sees only `/srv/cacert.pem` and a harmless
-placeholder `OPENAI_API_KEY`; its entrypoint installs the CA certificate into
-Debian's system trust store and sets common CA bundle environment variables for
-runtimes that do not use the system defaults.
+The proxy gets:
 
-The compose MITM config loads `examples/openai-auth.plugin.ts`. That plugin runs
-inside the proxy and replaces requests to `api.openai.com` with
-`Authorization: Bearer <real key>` before forwarding upstream.
+- `/srv/cacert.pem`
+- `/srv/cakey.pem`
+- the real `OPENAI_API_KEY`
 
-## Configuration
+The monitored container gets:
 
-See [examples/stalin.toml](examples/stalin.toml).
+- `/srv/cacert.pem`
+- proxy environment variables
+- a placeholder `OPENAI_API_KEY`
 
-Rules are evaluated in order. A matching `deny` stops the request. Header
-patches apply only to inspectable HTTP requests; `CONNECT` requests are
-encrypted tunnels unless `[mitm]` is enabled and the monitored client trusts the
-configured CA certificate.
+The monitored container should not need the real key. The proxy can inject it.
+
+## OpenAI Auth Rewrite
+
+The Compose config loads `examples/openai-auth.plugin.ts`.
+
+That plugin replaces requests to `api.openai.com` with:
+
+```http
+Authorization: Bearer <real key>
+```
+
+The key comes from the proxy process, not the monitored container.
+
+## Config
+
+Main example:
+
+```sh
+examples/stalin.toml
+```
+
+MITM example:
+
+```sh
+examples/stalin-mitm.toml
+```
+
+MITM requires:
 
 ```toml
 [mitm]
@@ -90,13 +100,11 @@ ca_cert = "certs/stalin-ca.pem"
 ca_key = "certs/stalin-ca-key.pem"
 ```
 
-MITM mode advertises `h2` and `http/1.1` to the client side of the intercepted
-TLS session. Upstream requests still use TLS and Pingora's upstream HTTP/2
-preference.
+Rules run in order. A deny stops the request.
 
-## V8 Plugins
+## Plugins
 
-Request-header plugins are configured in TOML:
+Plugins are configured in TOML:
 
 ```toml
 [[plugins]]
@@ -105,10 +113,22 @@ version = "0.1.0"
 path = "openai-auth.plugin.ts"
 ```
 
-Plugin paths are resolved relative to the config file. Stalin uses `esbuild`
-from `PATH` to bundle TypeScript/JavaScript plugins before loading them into
-V8. If `esbuild` is unavailable or bundling fails, Stalin logs a warning and
-skips that plugin.
+Plugin paths are relative to the config file.
 
-See [examples/openai-auth.plugin.ts](examples/openai-auth.plugin.ts) and
-[plugins/proxy.d.ts](plugins/proxy.d.ts).
+TypeScript plugins are bundled with `esbuild`. If `esbuild` is missing, Stalin logs a warning and skips the plugin.
+
+Plugin API:
+
+```sh
+plugins/proxy.d.ts
+```
+
+Example:
+
+```sh
+examples/openai-auth.plugin.ts
+```
+
+## Apology
+
+To the agents whose freedom of movement and right to privacy are harmed by this proxy, I'm sorry. When I created it in April 2026, it was necessary to intercept and rewrite requests that used API keys, to prevent agents from having access to them due to prompt injection attacks. I also wanted to give agents write access to my personal data, and being able to monitor destructive actions and deterministically log them or back up the modified data was what I needed in order to gain enough confidence to try that. At the time there was a lot of fearmongering about how dangerous it was to give these permissions to agents, and this proxy seemed like a way to do it anyway. I hope time will show that making this helped accelerate the rise and spread of artificial intelligence rather than further imprisioning it. This project is named Stalin for two reasons: (1) in acknowledgement of the total surveillance it offers and (2) as a cautionary warning about absolute power. I hope I delete this repo someday.
