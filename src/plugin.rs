@@ -103,6 +103,176 @@ impl PluginRuntime {
         }
         Ok(outcomes)
     }
+
+    pub async fn on_request_body_data(
+        &self,
+        req: &RequestInfo,
+        index: usize,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        for plugin in &self.plugins {
+            let plugin = plugin.clone();
+            let plugin_name = plugin.name.clone();
+            let secrets = self.secrets.clone();
+            let input = BodyDataInput::new(req, index, bytes, content_type);
+            let output: PluginBodyOutput = task::spawn_blocking(move || {
+                run_plugin_hook(plugin, secrets, input, "onRequestBodyData")
+            })
+            .await
+            .context("plugin task panicked")??;
+
+            self.write_audit_events(req, &plugin_name, output.audit_events)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn on_response_body_data(
+        &self,
+        req: &RequestInfo,
+        index: usize,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        for plugin in &self.plugins {
+            let plugin = plugin.clone();
+            let plugin_name = plugin.name.clone();
+            let secrets = self.secrets.clone();
+            let input =
+                BodyDataInput::new_with_direction(req, "response", index, bytes, content_type);
+            let output: PluginBodyOutput = task::spawn_blocking(move || {
+                run_plugin_hook(plugin, secrets, input, "onResponseBodyData")
+            })
+            .await
+            .context("plugin task panicked")??;
+
+            self.write_audit_events(req, &plugin_name, output.audit_events)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn on_request_body_done(
+        &self,
+        req: &RequestInfo,
+        bytes_seen: usize,
+        chunks_seen: usize,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<Vec<PluginBodyOutcome>> {
+        let mut outcomes = Vec::new();
+        for plugin in &self.plugins {
+            let plugin = plugin.clone();
+            let plugin_name = plugin.name.clone();
+            let secrets = self.secrets.clone();
+            let input = BodyDoneInput::new(req, bytes_seen, chunks_seen, body, content_type);
+            let output: PluginBodyOutput = task::spawn_blocking(move || {
+                run_plugin_hook(plugin, secrets, input, "onRequestBodyDone")
+            })
+            .await
+            .context("plugin task panicked")??;
+
+            self.write_audit_events(req, &plugin_name, output.audit_events)
+                .await?;
+            outcomes.push(PluginBodyOutcome {
+                plugin_name,
+                result: output.result.unwrap_or_default(),
+            });
+        }
+        Ok(outcomes)
+    }
+
+    pub async fn on_response_body_done(
+        &self,
+        req: &RequestInfo,
+        bytes_seen: usize,
+        chunks_seen: usize,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<Vec<PluginBodyOutcome>> {
+        let mut outcomes = Vec::new();
+        for plugin in &self.plugins {
+            let plugin = plugin.clone();
+            let plugin_name = plugin.name.clone();
+            let secrets = self.secrets.clone();
+            let input = BodyDoneInput::new_with_direction(
+                req,
+                "response",
+                bytes_seen,
+                chunks_seen,
+                body,
+                content_type,
+            );
+            let output: PluginBodyOutput = task::spawn_blocking(move || {
+                run_plugin_hook(plugin, secrets, input, "onResponseBodyDone")
+            })
+            .await
+            .context("plugin task panicked")??;
+
+            self.write_audit_events(req, &plugin_name, output.audit_events)
+                .await?;
+            outcomes.push(PluginBodyOutcome {
+                plugin_name,
+                result: output.result.unwrap_or_default(),
+            });
+        }
+        Ok(outcomes)
+    }
+
+    pub async fn on_response_headers(
+        &self,
+        req: &RequestInfo,
+        status: u16,
+        headers: &HeaderMap,
+    ) -> anyhow::Result<Vec<PluginResponseHeadersOutcome>> {
+        let mut outcomes = Vec::new();
+        for plugin in &self.plugins {
+            let plugin = plugin.clone();
+            let plugin_name = plugin.name.clone();
+            let secrets = self.secrets.clone();
+            let input = ResponseHeadersInput::new(req, status, headers);
+            let output: PluginResponseHeadersOutput = task::spawn_blocking(move || {
+                run_plugin_hook(plugin, secrets, input, "onResponseHeaders")
+            })
+            .await
+            .context("plugin task panicked")??;
+
+            self.write_audit_events(req, &plugin_name, output.audit_events)
+                .await?;
+            outcomes.push(PluginResponseHeadersOutcome {
+                plugin_name,
+                result: output.result.unwrap_or_default(),
+            });
+        }
+        Ok(outcomes)
+    }
+
+    async fn write_audit_events(
+        &self,
+        req: &RequestInfo,
+        plugin_name: &str,
+        events: Vec<Value>,
+    ) -> anyhow::Result<()> {
+        for event in events {
+            self.audit
+                .write(&AuditEvent {
+                    r#type: event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("plugin.audit"),
+                    level: event.get("level").and_then(Value::as_str).unwrap_or("info"),
+                    request_id: &req.request_id,
+                    connection_id: &req.connection_id,
+                    method: req.method.as_str(),
+                    url: req.url.as_str(),
+                    matched_rule: Some(plugin_name),
+                    message: event.get("message").and_then(Value::as_str),
+                })
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -130,14 +300,19 @@ pub enum PluginResult {
         add_headers: serde_json::Map<String, Value>,
         #[serde(default, rename = "removeHeaders")]
         remove_headers: Vec<String>,
+        body: Option<PluginBodyPolicy>,
     },
     Deny {
         status: u16,
-        body: Option<String>,
+        body: Option<PluginBody>,
+        #[serde(default)]
+        headers: serde_json::Map<String, Value>,
     },
     Respond {
         status: u16,
-        body: Option<String>,
+        body: Option<PluginBody>,
+        #[serde(default)]
+        headers: serde_json::Map<String, Value>,
     },
     Route {
         upstream: String,
@@ -147,6 +322,7 @@ pub enum PluginResult {
         add_headers: serde_json::Map<String, Value>,
         #[serde(default, rename = "removeHeaders")]
         remove_headers: Vec<String>,
+        body: Option<PluginBodyPolicy>,
     },
 }
 
@@ -156,6 +332,7 @@ impl Default for PluginResult {
             set_headers: serde_json::Map::new(),
             add_headers: serde_json::Map::new(),
             remove_headers: Vec::new(),
+            body: None,
         }
     }
 }
@@ -167,6 +344,7 @@ impl PluginResult {
                 set_headers,
                 add_headers,
                 remove_headers,
+                ..
             } => Some(PluginHeaderPatch {
                 set_headers,
                 add_headers,
@@ -185,6 +363,33 @@ impl PluginResult {
             }),
         }
     }
+
+    pub fn body_policy(&self) -> Option<&PluginBodyPolicy> {
+        match self {
+            PluginResult::Continue { body, .. } | PluginResult::Route { body, .. } => body.as_ref(),
+            PluginResult::Deny { .. } | PluginResult::Respond { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginBodyPolicy {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<usize>,
+    #[serde(default)]
+    pub overflow: Option<String>,
+}
+
+impl PluginBodyPolicy {
+    pub fn is_buffered(&self) -> bool {
+        self.mode.as_deref() == Some("buffer")
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes.unwrap_or(1024 * 1024)
+    }
 }
 
 #[derive(Debug)]
@@ -194,9 +399,129 @@ pub struct PluginHeaderPatch<'a> {
     pub remove_headers: &'a [String],
 }
 
+#[derive(Debug)]
+pub struct PluginBodyOutcome {
+    pub plugin_name: String,
+    pub result: PluginBodyDoneResult,
+}
+
+#[derive(Debug)]
+pub struct PluginResponseHeadersOutcome {
+    pub plugin_name: String,
+    pub result: PluginResponseHeadersResult,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PluginBodyDoneResult {
+    #[default]
+    Continue,
+    Replace {
+        body: PluginBody,
+    },
+    Deny {
+        status: u16,
+        body: Option<PluginBody>,
+        #[serde(default)]
+        headers: serde_json::Map<String, Value>,
+    },
+    Respond {
+        status: u16,
+        body: Option<PluginBody>,
+        #[serde(default)]
+        headers: serde_json::Map<String, Value>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum PluginBody {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl PluginBody {
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Text(text) => text.into_bytes(),
+            Self::Bytes(bytes) => bytes,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PluginResponseHeadersResult {
+    Continue {
+        #[serde(default, rename = "setHeaders")]
+        set_headers: serde_json::Map<String, Value>,
+        #[serde(default, rename = "addHeaders")]
+        add_headers: serde_json::Map<String, Value>,
+        #[serde(default, rename = "removeHeaders")]
+        remove_headers: Vec<String>,
+        body: Option<PluginBodyPolicy>,
+    },
+    Respond {
+        status: u16,
+        body: Option<PluginBody>,
+        #[serde(default)]
+        headers: serde_json::Map<String, Value>,
+    },
+}
+
+impl Default for PluginResponseHeadersResult {
+    fn default() -> Self {
+        Self::Continue {
+            set_headers: serde_json::Map::new(),
+            add_headers: serde_json::Map::new(),
+            remove_headers: Vec::new(),
+            body: None,
+        }
+    }
+}
+
+impl PluginResponseHeadersResult {
+    pub fn patches(&self) -> Option<PluginHeaderPatch<'_>> {
+        match self {
+            PluginResponseHeadersResult::Continue {
+                set_headers,
+                add_headers,
+                remove_headers,
+                ..
+            } => Some(PluginHeaderPatch {
+                set_headers,
+                add_headers,
+                remove_headers,
+            }),
+            PluginResponseHeadersResult::Respond { .. } => None,
+        }
+    }
+
+    pub fn body_policy(&self) -> Option<&PluginBodyPolicy> {
+        match self {
+            PluginResponseHeadersResult::Continue { body, .. } => body.as_ref(),
+            PluginResponseHeadersResult::Respond { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PluginOutput {
     result: Option<PluginResult>,
+    #[serde(default, rename = "auditEvents")]
+    audit_events: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginBodyOutput {
+    result: Option<PluginBodyDoneResult>,
+    #[serde(default, rename = "auditEvents")]
+    audit_events: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginResponseHeadersOutput {
+    result: Option<PluginResponseHeadersResult>,
     #[serde(default, rename = "auditEvents")]
     audit_events: Vec<Value>,
 }
@@ -218,6 +543,158 @@ impl PluginInput {
             },
         }
     }
+}
+
+#[derive(Serialize)]
+struct BodyDataInput {
+    chunk: BodyChunkPayload,
+    ctx: HookContextPayload,
+}
+
+impl BodyDataInput {
+    fn new(req: &RequestInfo, index: usize, bytes: &[u8], content_type: Option<&str>) -> Self {
+        Self::new_with_direction(req, "request", index, bytes, content_type)
+    }
+
+    fn new_with_direction(
+        req: &RequestInfo,
+        direction: &'static str,
+        index: usize,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Self {
+        let phase = match direction {
+            "response" => "response_body",
+            _ => "request_body",
+        };
+        Self {
+            chunk: BodyChunkPayload {
+                request_id: req.request_id.clone(),
+                direction,
+                index,
+                bytes: bytes.to_vec(),
+                content_type: content_type.map(ToOwned::to_owned),
+            },
+            ctx: HookContextPayload {
+                request_id: req.request_id.clone(),
+                connection_id: req.connection_id.clone(),
+                phase,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BodyDoneInput {
+    body: BodyDonePayload,
+    ctx: HookContextPayload,
+}
+
+#[derive(Serialize)]
+struct ResponseHeadersInput {
+    res: ResponseHeadersPayload,
+    ctx: HookContextPayload,
+}
+
+impl ResponseHeadersInput {
+    fn new(req: &RequestInfo, status: u16, headers: &HeaderMap) -> Self {
+        Self {
+            res: ResponseHeadersPayload {
+                request_id: req.request_id.clone(),
+                status,
+                header_entries: headers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+                    })
+                    .collect(),
+            },
+            ctx: HookContextPayload {
+                request_id: req.request_id.clone(),
+                connection_id: req.connection_id.clone(),
+                phase: "response_headers",
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ResponseHeadersPayload {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    status: u16,
+    #[serde(rename = "headerEntries")]
+    header_entries: Vec<(String, String)>,
+}
+
+impl BodyDoneInput {
+    fn new(
+        req: &RequestInfo,
+        bytes_seen: usize,
+        chunks_seen: usize,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> Self {
+        Self::new_with_direction(req, "request", bytes_seen, chunks_seen, body, content_type)
+    }
+
+    fn new_with_direction(
+        req: &RequestInfo,
+        direction: &'static str,
+        bytes_seen: usize,
+        chunks_seen: usize,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> Self {
+        let phase = match direction {
+            "response" => "response_end",
+            _ => "request_end",
+        };
+        Self {
+            body: BodyDonePayload {
+                request_id: req.request_id.clone(),
+                direction,
+                bytes_seen,
+                chunks_seen,
+                bytes: body.map(|body| body.to_vec()),
+                text: body.and_then(|body| std::str::from_utf8(body).ok().map(ToOwned::to_owned)),
+                content_type: content_type.map(ToOwned::to_owned),
+            },
+            ctx: HookContextPayload {
+                request_id: req.request_id.clone(),
+                connection_id: req.connection_id.clone(),
+                phase,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BodyChunkPayload {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    direction: &'static str,
+    index: usize,
+    bytes: Vec<u8>,
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BodyDonePayload {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    direction: &'static str,
+    #[serde(rename = "bytesSeen")]
+    bytes_seen: usize,
+    #[serde(rename = "chunksSeen")]
+    chunks_seen: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +769,19 @@ fn run_request_headers_plugin(
     secrets: SecretStore,
     input: PluginInput,
 ) -> anyhow::Result<PluginOutput> {
+    run_plugin_hook(plugin, secrets, input, "onRequestHeaders")
+}
+
+fn run_plugin_hook<I, O>(
+    plugin: LoadedPlugin,
+    secrets: SecretStore,
+    input: I,
+    hook: &str,
+) -> anyhow::Result<O>
+where
+    I: Serialize,
+    O: for<'de> Deserialize<'de>,
+{
     let mut isolate = v8::Isolate::new(v8::CreateParams::default());
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     v8::scope!(let scope, &mut isolate);
@@ -319,12 +809,16 @@ fn run_request_headers_plugin(
     )?;
 
     let input_json = serde_json::to_string(&input)?;
+    let hook_json = serde_json::to_string(hook)?;
     let invoke_source = format!(
         r#"
 const __stalinInput = {input_json};
 globalThis.__stalinAuditEvents.length = 0;
-globalThis.__stalinInvoke(__stalinInput.req, __stalinInput.ctx)
-  .then((result) => ({{ result, auditEvents: globalThis.__stalinAuditEvents }}));
+globalThis.__stalinInvoke({hook_json}, __stalinInput)
+  .then((result) => ({{
+    result: __stalinNormalizeResult(result),
+    auditEvents: globalThis.__stalinAuditEvents,
+  }}));
 "#
     );
     let value = run_script(scope, &invoke_source, "stalin:invoke")?;
@@ -548,14 +1042,72 @@ function __stalinHeaders(entries) {{
   }});
 }}
 
-globalThis.__stalinInvoke = async function(req, ctx) {{
-  req.headers = __stalinHeaders(req.headerEntries ?? []);
-  delete req.headerEntries;
+function __stalinBodyEvent(event) {{
+  if (Array.isArray(event.bytes)) {{
+    event.bytes = new Uint8Array(event.bytes);
+  }}
+  return event;
+}}
+
+function __stalinNormalizeResult(result) {{
+  if (!result || typeof result !== "object") {{
+    return result;
+  }}
+  if (result.body instanceof Uint8Array) {{
+    return {{ ...result, body: Array.from(result.body) }};
+  }}
+  return result;
+}}
+
+globalThis.__stalinInvoke = async function(hook, input) {{
   const plugin = globalThis.__stalinPlugin;
-  if (!plugin || typeof plugin.onRequestHeaders !== "function") {{
+  if (!plugin || typeof plugin[hook] !== "function") {{
     return {{ action: "continue" }};
   }}
-  return await plugin.onRequestHeaders(Object.freeze(req), Object.freeze(ctx));
+
+  if (hook === "onRequestHeaders") {{
+    const req = input.req;
+    req.headers = __stalinHeaders(req.headerEntries ?? []);
+    delete req.headerEntries;
+    return await plugin[hook](Object.freeze(req), Object.freeze(input.ctx));
+  }}
+
+  if (hook === "onRequestBodyData") {{
+    return await plugin[hook](
+      Object.freeze(__stalinBodyEvent(input.chunk)),
+      Object.freeze(input.ctx),
+    );
+  }}
+
+  if (hook === "onRequestBodyDone") {{
+    return await plugin[hook](
+      Object.freeze(__stalinBodyEvent(input.body)),
+      Object.freeze(input.ctx),
+    );
+  }}
+
+  if (hook === "onResponseHeaders") {{
+    const res = input.res;
+    res.headers = __stalinHeaders(res.headerEntries ?? []);
+    delete res.headerEntries;
+    return await plugin[hook](Object.freeze(res), Object.freeze(input.ctx));
+  }}
+
+  if (hook === "onResponseBodyData") {{
+    return await plugin[hook](
+      Object.freeze(__stalinBodyEvent(input.chunk)),
+      Object.freeze(input.ctx),
+    );
+  }}
+
+  if (hook === "onResponseBodyDone") {{
+    return await plugin[hook](
+      Object.freeze(__stalinBodyEvent(input.body)),
+      Object.freeze(input.ctx),
+    );
+  }}
+
+  return {{ action: "continue" }};
 }};
 "#
     )
@@ -673,6 +1225,186 @@ export default plugin;
                     set_headers["x-plugin"],
                     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
                 );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_can_request_buffered_body_and_replace_it() {
+        let file = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+const plugin = {
+  onRequestHeaders() {
+    return {
+      action: "continue",
+      body: { mode: "buffer", maxBytes: 64 },
+    };
+  },
+  onRequestBodyDone(body) {
+    if (body.text !== "before") throw new Error(`unexpected body ${body.text}`);
+    return { action: "replace", body: new Uint8Array([97, 102, 116, 101, 114]) };
+  },
+};
+export default plugin;
+"#,
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            vec![PluginConfig {
+                name: "test".to_string(),
+                version: "0.1.0".to_string(),
+                path: file.path().to_path_buf(),
+                config: None,
+            }],
+            SecretStore::new(std::collections::HashMap::new()),
+            AuditLog::new(None).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let req = RequestInfo::new(
+            http::Method::POST,
+            Url::parse("https://api.example.com/v1").unwrap(),
+        );
+        let headers = HeaderMap::new();
+        let outcomes = runtime.on_request_headers(&req, &headers).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let policy = outcomes[0].result.body_policy().unwrap();
+        assert!(policy.is_buffered());
+        assert_eq!(policy.max_bytes(), 64);
+
+        let outcomes = runtime
+            .on_request_body_done(&req, 6, 1, Some(b"before"), Some("text/plain"))
+            .await
+            .unwrap();
+
+        match &outcomes[0].result {
+            PluginBodyDoneResult::Replace { body } => {
+                assert_eq!(body, &PluginBody::Bytes(b"after".to_vec()));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_can_patch_response_headers() {
+        let file = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+const plugin = {
+  onResponseHeaders(res) {
+    if (res.status !== 201) throw new Error(`unexpected status ${res.status}`);
+    if (res.headers.get("x-upstream") !== "1") throw new Error("missing upstream header");
+    return {
+      action: "continue",
+      setHeaders: { "x-plugin-response": "yes" },
+      removeHeaders: ["x-upstream"],
+    };
+  },
+};
+export default plugin;
+"#,
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            vec![PluginConfig {
+                name: "test".to_string(),
+                version: "0.1.0".to_string(),
+                path: file.path().to_path_buf(),
+                config: None,
+            }],
+            SecretStore::new(std::collections::HashMap::new()),
+            AuditLog::new(None).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let req = RequestInfo::new(
+            http::Method::POST,
+            Url::parse("https://api.example.com/v1").unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-upstream", "1".parse().unwrap());
+
+        let outcomes = runtime
+            .on_response_headers(&req, 201, &headers)
+            .await
+            .unwrap();
+
+        match &outcomes[0].result {
+            PluginResponseHeadersResult::Continue {
+                set_headers,
+                remove_headers,
+                ..
+            } => {
+                assert_eq!(set_headers["x-plugin-response"], "yes");
+                assert_eq!(remove_headers, &["x-upstream"]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_can_request_buffered_response_body_and_replace_it() {
+        let file = tempfile::Builder::new().suffix(".ts").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"
+const plugin = {
+  onResponseHeaders(res) {
+    if (res.status !== 200) throw new Error(`unexpected status ${res.status}`);
+    return {
+      action: "continue",
+      body: { mode: "buffer", maxBytes: 64 },
+    };
+  },
+  onResponseBodyDone(body, ctx) {
+    if (ctx.phase !== "response_end") throw new Error(`unexpected phase ${ctx.phase}`);
+    if (body.direction !== "response") throw new Error(`unexpected direction ${body.direction}`);
+    if (body.text !== "before") throw new Error(`unexpected body ${body.text}`);
+    return { action: "replace", body: "after" };
+  },
+};
+export default plugin;
+"#,
+        )
+        .unwrap();
+        let runtime = PluginRuntime::new(
+            vec![PluginConfig {
+                name: "test".to_string(),
+                version: "0.1.0".to_string(),
+                path: file.path().to_path_buf(),
+                config: None,
+            }],
+            SecretStore::new(std::collections::HashMap::new()),
+            AuditLog::new(None).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let req = RequestInfo::new(
+            http::Method::POST,
+            Url::parse("https://api.example.com/v1").unwrap(),
+        );
+        let headers = HeaderMap::new();
+        let outcomes = runtime
+            .on_response_headers(&req, 200, &headers)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let policy = outcomes[0].result.body_policy().unwrap();
+        assert!(policy.is_buffered());
+        assert_eq!(policy.max_bytes(), 64);
+
+        let outcomes = runtime
+            .on_response_body_done(&req, 6, 1, Some(b"before"), Some("text/plain"))
+            .await
+            .unwrap();
+
+        match &outcomes[0].result {
+            PluginBodyDoneResult::Replace { body } => {
+                assert_eq!(body, &PluginBody::Text("after".to_string()));
             }
             other => panic!("unexpected result: {other:?}"),
         }

@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, Method, StatusCode, Version};
 use pingora::{
     apps::{HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream},
@@ -36,7 +36,10 @@ use crate::{
     audit::AuditLog,
     config::Config,
     mitm::MitmAuthority,
-    policy::{PolicyDecision, PolicyEngine, RequestInfo, target_url_with_default_scheme},
+    policy::{
+        BodyDecision, PolicyDecision, PolicyEngine, RequestInfo, ResponseDecision,
+        target_url_with_default_scheme,
+    },
 };
 
 pub struct ProxyServer {
@@ -84,6 +87,27 @@ struct StalinPingoraApp {
     mitm: Option<Arc<MitmAuthority>>,
     policy: PolicyEngine,
     options: HttpServerOptions,
+}
+
+enum BufferedBodyDecision {
+    Continue(Bytes),
+    Deny(ImmediateBodyResponse),
+}
+
+struct ImmediateBodyResponse {
+    status: StatusCode,
+    body: Bytes,
+    headers: HeaderMap,
+}
+
+impl ImmediateBodyResponse {
+    fn payload_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: Bytes::from_static(b"body exceeded buffer limit\n"),
+            headers: HeaderMap::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -151,29 +175,35 @@ impl StalinPingoraApp {
         default_scheme: &str,
         upstream_version: UpstreamVersion,
     ) -> Result<(), ProxyError> {
-        let (method, mut target, protocol, mut outbound_headers) = {
+        let (method, mut target, protocol, mut outbound_headers, content_type) = {
             let req = http.req_header();
             (
                 req.method.clone(),
                 target_url_from_request(req, default_scheme)?,
                 protocol_name(req.version),
                 sanitized_headers(&req.headers),
+                req.headers
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
             )
         };
         let request_info = RequestInfo::with_protocol(method.clone(), target.clone(), protocol);
 
-        match self
+        let body_policy = match self
             .policy
             .evaluate(&request_info, &mut outbound_headers)
             .await?
         {
             PolicyDecision::Deny(resp) => {
-                write_immediate_response(http, resp.status, resp.body).await?;
+                write_immediate_response_with_headers(http, resp.status, resp.body, &resp.headers)
+                    .await?;
                 return Ok(());
             }
             PolicyDecision::Continue {
                 matched_rules,
                 upstream,
+                body_policy,
             } => {
                 if let Some(upstream) = upstream {
                     target = routed_url(upstream, &target);
@@ -186,10 +216,52 @@ impl StalinPingoraApp {
                         "request policy applied"
                     );
                 }
+                body_policy
             }
-        }
+        };
+
+        let buffered_body = if body_policy
+            .as_ref()
+            .is_some_and(|policy| policy.is_buffered())
+        {
+            let policy = body_policy.as_ref().expect("checked buffered body policy");
+            match self
+                .buffer_request_body(
+                    http,
+                    &request_info,
+                    policy.max_bytes(),
+                    content_type.as_deref(),
+                )
+                .await?
+            {
+                BufferedBodyDecision::Continue(body) => Some(body),
+                BufferedBodyDecision::Deny(resp) => {
+                    write_immediate_response_with_headers(
+                        http,
+                        resp.status,
+                        resp.body,
+                        &resp.headers,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
 
         let peer = upstream_peer_with_version(&target, upstream_version).await?;
+        if let Some(body) = &buffered_body {
+            outbound_headers.remove(http::header::TRANSFER_ENCODING);
+            outbound_headers.insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&body.len().to_string()).map_err(|err| {
+                    ProxyError::BadGateway(anyhow::anyhow!(
+                        "failed to set buffered body content-length: {err}"
+                    ))
+                })?,
+            );
+        }
         let mut upstream_req = upstream_request(method, &target, &outbound_headers)?;
         set_host_header(&mut upstream_req, &target)?;
 
@@ -202,13 +274,100 @@ impl StalinPingoraApp {
         upstream
             .write_request_header(Box::new(upstream_req))
             .await?;
-        stream_request_body(http, &mut upstream).await?;
+        if let Some(body) = buffered_body {
+            upstream.write_request_body(body, false).await?;
+            upstream.finish_request_body().await?;
+        } else {
+            self.stream_request_body_with_hooks(
+                http,
+                &mut upstream,
+                &request_info,
+                content_type.as_deref(),
+            )
+            .await?;
+        }
         upstream.read_response_header().await?;
 
-        write_upstream_response(http, &mut upstream).await?;
-        self.connector
-            .release_http_session(upstream, &peer, Some(std::time::Duration::from_secs(60)))
-            .await;
+        let reusable =
+            write_upstream_response_with_hooks(http, &mut upstream, &self.policy, &request_info)
+                .await?;
+        if reusable {
+            self.connector
+                .release_http_session(upstream, &peer, Some(std::time::Duration::from_secs(60)))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn buffer_request_body(
+        &self,
+        http: &mut ServerSession,
+        request_info: &RequestInfo,
+        max_bytes: usize,
+        content_type: Option<&str>,
+    ) -> Result<BufferedBodyDecision, ProxyError> {
+        let mut body = BytesMut::new();
+        let mut chunks_seen = 0usize;
+        while let Some(chunk) = http.read_request_body().await? {
+            self.policy
+                .observe_request_body_data(request_info, chunks_seen, &chunk, content_type)
+                .await?;
+            chunks_seen += 1;
+            if body.len() + chunk.len() > max_bytes {
+                return Ok(BufferedBodyDecision::Deny(
+                    ImmediateBodyResponse::payload_too_large(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let mut body = body.freeze();
+        match self
+            .policy
+            .finish_request_body(
+                request_info,
+                body.len(),
+                chunks_seen,
+                Some(&body),
+                content_type,
+            )
+            .await?
+        {
+            BodyDecision::Continue { replacement } => {
+                if let Some(replacement) = replacement {
+                    body = replacement;
+                }
+                Ok(BufferedBodyDecision::Continue(body))
+            }
+            BodyDecision::Deny(resp) => Ok(BufferedBodyDecision::Deny(ImmediateBodyResponse {
+                status: resp.status,
+                body: resp.body,
+                headers: resp.headers,
+            })),
+        }
+    }
+
+    async fn stream_request_body_with_hooks(
+        &self,
+        http: &mut ServerSession,
+        upstream: &mut pingora::protocols::http::client::HttpSession,
+        request_info: &RequestInfo,
+        content_type: Option<&str>,
+    ) -> Result<(), ProxyError> {
+        let mut bytes_seen = 0usize;
+        let mut chunks_seen = 0usize;
+        while let Some(chunk) = http.read_request_body().await? {
+            self.policy
+                .observe_request_body_data(request_info, chunks_seen, &chunk, content_type)
+                .await?;
+            bytes_seen += chunk.len();
+            chunks_seen += 1;
+            upstream.write_request_body(chunk, false).await?;
+        }
+        self.policy
+            .finish_request_body(request_info, bytes_seen, chunks_seen, None, content_type)
+            .await?;
+        upstream.finish_request_body().await?;
         Ok(())
     }
 
@@ -232,7 +391,13 @@ impl StalinPingoraApp {
 
         match self.policy.evaluate(&request_info, &mut headers).await? {
             PolicyDecision::Deny(resp) => {
-                write_immediate_response(&mut http, resp.status, resp.body).await?;
+                write_immediate_response_with_headers(
+                    &mut http,
+                    resp.status,
+                    resp.body,
+                    &resp.headers,
+                )
+                .await?;
                 return Ok(Some(http));
             }
             PolicyDecision::Continue { matched_rules, .. } => {
@@ -449,12 +614,19 @@ impl StalinPingoraApp {
         {
             PolicyDecision::Deny(resp) => {
                 let mut http = http;
-                write_immediate_response(&mut http, resp.status, resp.body).await?;
+                write_immediate_response_with_headers(
+                    &mut http,
+                    resp.status,
+                    resp.body,
+                    &resp.headers,
+                )
+                .await?;
                 return Ok(Some(http));
             }
             PolicyDecision::Continue {
                 matched_rules,
                 upstream,
+                ..
             } => {
                 if upstream.is_some() {
                     let mut http = http;
@@ -631,17 +803,6 @@ async fn finish_session(http: ServerSession) -> Option<ReusedHttpStream> {
     }
 }
 
-async fn stream_request_body(
-    http: &mut ServerSession,
-    upstream: &mut pingora::protocols::http::client::HttpSession,
-) -> Result<(), ProxyError> {
-    while let Some(chunk) = http.read_request_body().await? {
-        upstream.write_request_body(chunk, false).await?;
-    }
-    upstream.finish_request_body().await?;
-    Ok(())
-}
-
 async fn write_upstream_response(
     http: &mut ServerSession,
     upstream: &mut pingora::protocols::http::client::HttpSession,
@@ -651,6 +812,109 @@ async fn write_upstream_response(
         .ok_or_else(|| ProxyError::BadGateway(anyhow::anyhow!("upstream response missing header")))?
         .clone();
 
+    write_response_header_from_upstream(http, &upstream_header).await?;
+    stream_upstream_response_body(http, upstream).await?;
+    Ok(())
+}
+
+async fn write_upstream_response_with_hooks(
+    http: &mut ServerSession,
+    upstream: &mut pingora::protocols::http::client::HttpSession,
+    policy: &PolicyEngine,
+    request_info: &RequestInfo,
+) -> Result<bool, ProxyError> {
+    let mut upstream_header = upstream
+        .response_header()
+        .ok_or_else(|| ProxyError::BadGateway(anyhow::anyhow!("upstream response missing header")))?
+        .clone();
+    let content_type = upstream_header
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    match policy
+        .evaluate_response_headers(
+            request_info,
+            upstream_header.status,
+            &mut upstream_header.headers,
+        )
+        .await?
+    {
+        ResponseDecision::Continue { body_policy } => {
+            let buffered_body = if body_policy
+                .as_ref()
+                .is_some_and(|policy| policy.is_buffered())
+            {
+                let response_body_policy = body_policy
+                    .as_ref()
+                    .expect("checked buffered response body policy");
+                match buffer_response_body(
+                    upstream,
+                    policy,
+                    request_info,
+                    response_body_policy.max_bytes(),
+                    content_type.as_deref(),
+                )
+                .await?
+                {
+                    BufferedBodyDecision::Continue(body) => Some(body),
+                    BufferedBodyDecision::Deny(resp) => {
+                        write_immediate_response_with_headers(
+                            http,
+                            resp.status,
+                            resp.body,
+                            &resp.headers,
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(body) = buffered_body {
+                upstream_header
+                    .headers
+                    .remove(http::header::TRANSFER_ENCODING);
+                upstream_header.headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    http::HeaderValue::from_str(&body.len().to_string()).map_err(|err| {
+                        ProxyError::BadGateway(anyhow::anyhow!(
+                            "failed to set buffered response content-length: {err}"
+                        ))
+                    })?,
+                );
+                write_response_header_from_upstream(http, &upstream_header).await?;
+                http.write_response_body(body, false).await?;
+                http.write_response_body(Bytes::new(), true).await?;
+                return Ok(true);
+            }
+
+            write_response_header_from_upstream(http, &upstream_header).await?;
+            stream_upstream_response_body_with_hooks(
+                http,
+                upstream,
+                policy,
+                request_info,
+                content_type.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        ResponseDecision::Respond(resp) => {
+            write_immediate_response_with_headers(http, resp.status, resp.body, &resp.headers)
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn write_response_header_from_upstream(
+    http: &mut ServerSession,
+    upstream_header: &ResponseHeader,
+) -> Result<(), ProxyError> {
     let mut response =
         ResponseHeader::build_no_case(upstream_header.status, Some(upstream_header.headers.len()))?;
     for (name, value) in upstream_header.headers.iter() {
@@ -661,9 +925,87 @@ async fn write_upstream_response(
     }
 
     http.write_response_header(Box::new(response)).await?;
+    Ok(())
+}
+
+async fn stream_upstream_response_body(
+    http: &mut ServerSession,
+    upstream: &mut pingora::protocols::http::client::HttpSession,
+) -> Result<(), ProxyError> {
     while let Some(chunk) = upstream.read_response_body().await? {
         http.write_response_body(chunk, false).await?;
     }
+    http.write_response_body(Bytes::new(), true).await?;
+    Ok(())
+}
+
+async fn buffer_response_body(
+    upstream: &mut pingora::protocols::http::client::HttpSession,
+    policy: &PolicyEngine,
+    request_info: &RequestInfo,
+    max_bytes: usize,
+    content_type: Option<&str>,
+) -> Result<BufferedBodyDecision, ProxyError> {
+    let mut body = BytesMut::new();
+    let mut chunks_seen = 0usize;
+    while let Some(chunk) = upstream.read_response_body().await? {
+        policy
+            .observe_response_body_data(request_info, chunks_seen, &chunk, content_type)
+            .await?;
+        chunks_seen += 1;
+        if body.len() + chunk.len() > max_bytes {
+            return Ok(BufferedBodyDecision::Deny(
+                ImmediateBodyResponse::payload_too_large(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let mut body = body.freeze();
+    match policy
+        .finish_response_body(
+            request_info,
+            body.len(),
+            chunks_seen,
+            Some(&body),
+            content_type,
+        )
+        .await?
+    {
+        BodyDecision::Continue { replacement } => {
+            if let Some(replacement) = replacement {
+                body = replacement;
+            }
+            Ok(BufferedBodyDecision::Continue(body))
+        }
+        BodyDecision::Deny(resp) => Ok(BufferedBodyDecision::Deny(ImmediateBodyResponse {
+            status: resp.status,
+            body: resp.body,
+            headers: resp.headers,
+        })),
+    }
+}
+
+async fn stream_upstream_response_body_with_hooks(
+    http: &mut ServerSession,
+    upstream: &mut pingora::protocols::http::client::HttpSession,
+    policy: &PolicyEngine,
+    request_info: &RequestInfo,
+    content_type: Option<&str>,
+) -> Result<(), ProxyError> {
+    let mut bytes_seen = 0usize;
+    let mut chunks_seen = 0usize;
+    while let Some(chunk) = upstream.read_response_body().await? {
+        policy
+            .observe_response_body_data(request_info, chunks_seen, &chunk, content_type)
+            .await?;
+        bytes_seen += chunk.len();
+        chunks_seen += 1;
+        http.write_response_body(chunk, false).await?;
+    }
+    policy
+        .finish_response_body(request_info, bytes_seen, chunks_seen, None, content_type)
+        .await?;
     http.write_response_body(Bytes::new(), true).await?;
     Ok(())
 }
@@ -673,11 +1015,30 @@ async fn write_immediate_response(
     status: StatusCode,
     body: Bytes,
 ) -> Result<(), ProxyError> {
-    let mut response = ResponseHeader::build_no_case(status, Some(1))?;
+    write_immediate_response_with_headers(http, status, body, &HeaderMap::new()).await
+}
+
+async fn write_immediate_response_with_headers(
+    http: &mut ServerSession,
+    status: StatusCode,
+    body: Bytes,
+    headers: &HeaderMap,
+) -> Result<(), ProxyError> {
+    let mut response = ResponseHeader::build_no_case(status, Some(headers.len() + 1))?;
+    for (name, value) in headers {
+        if should_skip_immediate_response_header(name) {
+            continue;
+        }
+        response.append_header(name, value.clone())?;
+    }
     response.set_content_length(body.len())?;
     http.write_response_header(Box::new(response)).await?;
     http.write_response_body(body, true).await?;
     Ok(())
+}
+
+fn should_skip_immediate_response_header(name: &http::HeaderName) -> bool {
+    should_skip_response_header(name) || name == http::header::CONTENT_LENGTH
 }
 
 async fn write_error_response(

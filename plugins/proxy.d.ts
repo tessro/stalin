@@ -61,12 +61,43 @@ export default interface ProxyPlugin {
     req: RequestHeadersEvent,
     ctx: HookContext,
   ): Promise<RequestHeadersResult> | RequestHeadersResult;
+
+  onRequestBodyData?(
+    chunk: BodyChunkEvent,
+    ctx: HookContext,
+  ): Promise<BodyDataResult> | BodyDataResult;
+
+  onRequestBodyDone?(
+    body: BodyDoneEvent,
+    ctx: HookContext,
+  ): Promise<BodyDoneResult> | BodyDoneResult;
+
+  onResponseHeaders?(
+    res: ResponseHeadersEvent,
+    ctx: HookContext,
+  ): Promise<ResponseHeadersResult> | ResponseHeadersResult;
+
+  onResponseBodyData?(
+    chunk: BodyChunkEvent,
+    ctx: HookContext,
+  ): Promise<BodyDataResult> | BodyDataResult;
+
+  onResponseBodyDone?(
+    body: BodyDoneEvent,
+    ctx: HookContext,
+  ): Promise<BodyDoneResult> | BodyDoneResult;
 }
 
 export interface HookContext {
   readonly requestId: string;
   readonly connectionId: string;
-  readonly phase: "request_headers";
+  readonly phase:
+    | "request_headers"
+    | "request_body"
+    | "request_end"
+    | "response_headers"
+    | "response_body"
+    | "response_end";
   readonly matchedRule?: string;
   readonly metadata: MetadataMap;
 }
@@ -82,6 +113,12 @@ export interface RequestHeadersEvent {
   readonly method: string;
   readonly url: UrlParts;
   readonly protocol: "http/1.1" | "h2" | "h3";
+  readonly headers: HeadersView;
+}
+
+export interface ResponseHeadersEvent {
+  readonly requestId: string;
+  readonly status: number;
   readonly headers: HeadersView;
 }
 
@@ -112,6 +149,7 @@ export interface ContinueResult {
   setHeaders?: Record<string, HeaderValue>;
   addHeaders?: Record<string, HeaderValue>;
   removeHeaders?: string[];
+  body?: BodyPolicy;
 }
 
 export interface RouteResult {
@@ -119,12 +157,13 @@ export interface RouteResult {
   upstream: string;
   setHeaders?: Record<string, HeaderValue>;
   removeHeaders?: string[];
+  body?: BodyPolicy;
 }
 
 export interface DenyResult {
   action: "deny";
   status: number;
-  body?: string;
+  body?: string | Uint8Array;
   headers?: Record<string, HeaderValue>;
 }
 
@@ -142,3 +181,43 @@ export interface RedactedValue {
   readonly label: string;
   reveal(): Promise<string>;
 }
+
+export type BodyPolicy =
+  | { mode?: "stream" }
+  | { mode: "buffer"; maxBytes: number; overflow?: "deny" | "stream" };
+
+export interface BodyChunkEvent {
+  readonly requestId: string;
+  readonly direction: "request" | "response";
+  readonly index: number;
+  readonly bytes: Uint8Array;
+  readonly contentType?: string;
+}
+
+export interface BodyDoneEvent {
+  readonly requestId: string;
+  readonly direction: "request" | "response";
+  readonly bytesSeen: number;
+  readonly chunksSeen: number;
+  readonly bytes?: Uint8Array;
+  readonly text?: string;
+  readonly contentType?: string;
+}
+
+export type BodyDataResult = { action: "continue" };
+
+export type BodyDoneResult =
+  | { action: "continue" }
+  | { action: "replace"; body: string | Uint8Array }
+  | DenyResult
+  | RespondResult;
+
+export type ResponseHeadersResult =
+  | {
+      action: "continue";
+      setHeaders?: Record<string, HeaderValue>;
+      addHeaders?: Record<string, HeaderValue>;
+      removeHeaders?: string[];
+      body?: BodyPolicy;
+    }
+  | RespondResult;

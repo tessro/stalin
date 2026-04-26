@@ -6,7 +6,10 @@ use uuid::Uuid;
 use crate::{
     audit::{AuditEvent, AuditLog},
     config::{Config, DenyConfig, HeaderPatchConfig, HeaderValueConfig, MatchConfig, RuleConfig},
-    plugin::{PluginHeaderPatch, PluginResult, PluginRuntime},
+    plugin::{
+        PluginBodyDoneResult, PluginBodyPolicy, PluginHeaderPatch, PluginResponseHeadersResult,
+        PluginResult, PluginRuntime,
+    },
     secrets::SecretStore,
 };
 
@@ -65,8 +68,12 @@ impl PolicyEngine {
         }
 
         let mut upstream = None;
+        let mut body_policy = None;
         if let Some(plugins) = &self.plugins {
             for outcome in plugins.on_request_headers(req, headers).await? {
+                if let Some(policy) = outcome.result.body_policy() {
+                    body_policy = merge_body_policy(body_policy, policy);
+                }
                 match &outcome.result {
                     PluginResult::Continue { .. } => {
                         if let Some(patch) = outcome.result.patches() {
@@ -84,12 +91,23 @@ impl PolicyEngine {
                         upstream = Some(Url::parse(route_upstream)?);
                         matched_rules.push(format!("plugin:{}", outcome.plugin_name));
                     }
-                    PluginResult::Deny { status, body }
-                    | PluginResult::Respond { status, body } => {
-                        return Ok(PolicyDecision::Deny(ImmediateResponse {
-                            status: StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN),
-                            body: Bytes::from(body.clone().unwrap_or_default()),
-                        }));
+                    PluginResult::Deny {
+                        status,
+                        body,
+                        headers,
+                    }
+                    | PluginResult::Respond {
+                        status,
+                        body,
+                        headers,
+                    } => {
+                        return Ok(PolicyDecision::Deny(plugin_immediate_response(
+                            *status,
+                            StatusCode::FORBIDDEN,
+                            body,
+                            headers,
+                            &self.secrets,
+                        )?));
                     }
                 }
             }
@@ -98,7 +116,173 @@ impl PolicyEngine {
         Ok(PolicyDecision::Continue {
             matched_rules,
             upstream,
+            body_policy,
         })
+    }
+
+    pub async fn observe_request_body_data(
+        &self,
+        req: &RequestInfo,
+        index: usize,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(plugins) = &self.plugins {
+            plugins
+                .on_request_body_data(req, index, bytes, content_type)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn finish_request_body(
+        &self,
+        req: &RequestInfo,
+        bytes_seen: usize,
+        chunks_seen: usize,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<BodyDecision> {
+        let Some(plugins) = &self.plugins else {
+            return Ok(BodyDecision::Continue { replacement: None });
+        };
+
+        let mut replacement = None;
+        for outcome in plugins
+            .on_request_body_done(req, bytes_seen, chunks_seen, body, content_type)
+            .await?
+        {
+            match outcome.result {
+                PluginBodyDoneResult::Continue => {}
+                PluginBodyDoneResult::Replace { body } => {
+                    replacement = Some(Bytes::from(body.into_bytes()));
+                }
+                PluginBodyDoneResult::Deny {
+                    status,
+                    body,
+                    headers,
+                }
+                | PluginBodyDoneResult::Respond {
+                    status,
+                    body,
+                    headers,
+                } => {
+                    return Ok(BodyDecision::Deny(plugin_immediate_response(
+                        status,
+                        StatusCode::FORBIDDEN,
+                        &body,
+                        &headers,
+                        &self.secrets,
+                    )?));
+                }
+            }
+        }
+
+        Ok(BodyDecision::Continue { replacement })
+    }
+
+    pub async fn evaluate_response_headers(
+        &self,
+        req: &RequestInfo,
+        status: StatusCode,
+        headers: &mut HeaderMap,
+    ) -> anyhow::Result<ResponseDecision> {
+        let Some(plugins) = &self.plugins else {
+            return Ok(ResponseDecision::Continue { body_policy: None });
+        };
+
+        let mut body_policy = None;
+        for outcome in plugins
+            .on_response_headers(req, status.as_u16(), headers)
+            .await?
+        {
+            if let Some(policy) = outcome.result.body_policy() {
+                body_policy = merge_body_policy(body_policy, policy);
+            }
+            match &outcome.result {
+                PluginResponseHeadersResult::Continue { .. } => {
+                    if let Some(patch) = outcome.result.patches() {
+                        apply_plugin_patch(headers, patch, &self.secrets)?;
+                    }
+                }
+                PluginResponseHeadersResult::Respond {
+                    status,
+                    body,
+                    headers,
+                } => {
+                    return Ok(ResponseDecision::Respond(plugin_immediate_response(
+                        *status,
+                        StatusCode::OK,
+                        body,
+                        headers,
+                        &self.secrets,
+                    )?));
+                }
+            }
+        }
+
+        Ok(ResponseDecision::Continue { body_policy })
+    }
+
+    pub async fn observe_response_body_data(
+        &self,
+        req: &RequestInfo,
+        index: usize,
+        bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(plugins) = &self.plugins {
+            plugins
+                .on_response_body_data(req, index, bytes, content_type)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn finish_response_body(
+        &self,
+        req: &RequestInfo,
+        bytes_seen: usize,
+        chunks_seen: usize,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> anyhow::Result<BodyDecision> {
+        let Some(plugins) = &self.plugins else {
+            return Ok(BodyDecision::Continue { replacement: None });
+        };
+
+        let mut replacement = None;
+        for outcome in plugins
+            .on_response_body_done(req, bytes_seen, chunks_seen, body, content_type)
+            .await?
+        {
+            match outcome.result {
+                PluginBodyDoneResult::Continue => {}
+                PluginBodyDoneResult::Replace { body } => {
+                    replacement = Some(Bytes::from(body.into_bytes()));
+                }
+                PluginBodyDoneResult::Deny {
+                    status,
+                    body,
+                    headers,
+                }
+                | PluginBodyDoneResult::Respond {
+                    status,
+                    body,
+                    headers,
+                } => {
+                    return Ok(BodyDecision::Deny(plugin_immediate_response(
+                        status,
+                        StatusCode::FORBIDDEN,
+                        &body,
+                        &headers,
+                        &self.secrets,
+                    )?));
+                }
+            }
+        }
+
+        Ok(BodyDecision::Continue { replacement })
     }
 }
 
@@ -132,14 +316,30 @@ pub enum PolicyDecision {
     Continue {
         matched_rules: Vec<String>,
         upstream: Option<Url>,
+        body_policy: Option<PluginBodyPolicy>,
     },
     Deny(ImmediateResponse),
+}
+
+#[derive(Debug)]
+pub enum BodyDecision {
+    Continue { replacement: Option<Bytes> },
+    Deny(ImmediateResponse),
+}
+
+#[derive(Debug)]
+pub enum ResponseDecision {
+    Continue {
+        body_policy: Option<PluginBodyPolicy>,
+    },
+    Respond(ImmediateResponse),
 }
 
 #[derive(Debug)]
 pub struct ImmediateResponse {
     pub status: StatusCode,
     pub body: Bytes,
+    pub headers: HeaderMap,
 }
 
 fn deny_response(deny: &DenyConfig) -> ImmediateResponse {
@@ -150,7 +350,54 @@ fn deny_response(deny: &DenyConfig) -> ImmediateResponse {
                 .clone()
                 .unwrap_or_else(|| "request denied by Stalin policy\n".to_string()),
         ),
+        headers: HeaderMap::new(),
     }
+}
+
+fn plugin_immediate_response(
+    status: u16,
+    default_status: StatusCode,
+    body: &Option<crate::plugin::PluginBody>,
+    headers: &serde_json::Map<String, serde_json::Value>,
+    secrets: &SecretStore,
+) -> anyhow::Result<ImmediateResponse> {
+    Ok(ImmediateResponse {
+        status: StatusCode::from_u16(status).unwrap_or(default_status),
+        body: Bytes::from(
+            body.clone()
+                .map(crate::plugin::PluginBody::into_bytes)
+                .unwrap_or_default(),
+        ),
+        headers: plugin_response_headers(headers, secrets)?,
+    })
+}
+
+fn plugin_response_headers(
+    headers: &serde_json::Map<String, serde_json::Value>,
+    secrets: &SecretStore,
+) -> anyhow::Result<HeaderMap> {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        out.append(header_name(name)?, plugin_header_value(value, secrets)?);
+    }
+    Ok(out)
+}
+
+fn merge_body_policy(
+    current: Option<PluginBodyPolicy>,
+    next: &PluginBodyPolicy,
+) -> Option<PluginBodyPolicy> {
+    if !next.is_buffered() {
+        return current;
+    }
+
+    let mut next = next.clone();
+    if let Some(current) = current
+        && current.is_buffered()
+    {
+        next.max_bytes = Some(current.max_bytes().min(next.max_bytes()));
+    }
+    Some(next)
 }
 
 fn matches_rule(matcher: &MatchConfig, req: &RequestInfo) -> bool {
@@ -340,5 +587,27 @@ mod tests {
 
         assert!(!headers.contains_key("x-old"));
         assert_eq!(headers.get("x-new").unwrap(), "2");
+    }
+
+    #[test]
+    fn plugin_immediate_response_preserves_headers() {
+        let secrets = SecretStore::new(HashMap::<String, SecretConfig>::new());
+        let headers = serde_json::Map::from_iter([(
+            "x-denied-by".to_string(),
+            serde_json::Value::String("plugin".to_string()),
+        )]);
+
+        let response = plugin_immediate_response(
+            418,
+            StatusCode::FORBIDDEN,
+            &Some(crate::plugin::PluginBody::Text("nope".to_string())),
+            &headers,
+            &secrets,
+        )
+        .unwrap();
+
+        assert_eq!(response.status, StatusCode::IM_A_TEAPOT);
+        assert_eq!(response.body, Bytes::from_static(b"nope"));
+        assert_eq!(response.headers.get("x-denied-by").unwrap(), "plugin");
     }
 }

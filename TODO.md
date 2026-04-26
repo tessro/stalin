@@ -20,15 +20,16 @@
 
 ## Plugin Runtime
 
-- Add response header hooks:
-  - `onResponseHeaders`
-- Add request body hooks:
-  - `onRequestBodyChunk`
-  - `onRequestBodyEnd`
-- Add response body hooks:
-  - `onResponseBodyChunk`
-  - `onResponseBodyEnd`
-- Add plugin hook integration to the streamed request/response forwarding path.
+- Extend response header hooks with integration coverage through the proxy
+  forwarding path.
+- Extend request body hooks:
+  - support binary replacement bodies
+  - add integration coverage through the proxy forwarding path
+  - decide whether stream-mode hook failures should fail open or fail closed
+- Extend response body hooks:
+  - support binary replacement bodies
+  - add integration coverage through the proxy forwarding path
+  - decide whether stream-mode hook failures should fail open or fail closed
 - Implement body hook actions:
   - `continue`
   - `replace`
@@ -43,8 +44,6 @@
 ## Plugin Results
 
 - Implement synthetic `respond` as distinct from `deny`.
-- Support response headers on `deny` and `respond` results.
-- Support `Uint8Array` response bodies.
 - Implement `RedactedValue` and `reveal()`.
 - Decide whether `RouteResult.addHeaders` is a supported extension or should be
   removed to match `PLAN.md`.
