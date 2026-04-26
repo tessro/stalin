@@ -14,7 +14,8 @@ RUN apt-get update \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/stalin /usr/local/bin/stalin
-COPY examples/stalin.toml /etc/stalin/config.toml
+COPY examples/stalin-mitm.toml /etc/stalin/config.toml
+COPY examples/openai-auth.plugin.ts /etc/stalin/openai-auth.plugin.ts
 ENV STALIN_CONFIG=/etc/stalin/config.toml
 EXPOSE 8080
 ENTRYPOINT ["stalin"]

@@ -12,19 +12,6 @@ protect your personal data and keep your agents secure:
 - Log or block outbound traffic based on arbitrary rules.
 - Make out-of-band network requests, e.g. to back up data an agent is about to modify or delete.
 
-## Run
-
-```sh
-cargo run -- --config examples/stalin.toml
-```
-
-Point a client at it:
-
-```sh
-HTTP_PROXY=http://127.0.0.1:8080 curl http://example.com/
-HTTPS_PROXY=http://127.0.0.1:8080 curl https://example.com/
-```
-
 ## Docker MITM
 
 Generate a local CA:
@@ -79,19 +66,14 @@ The key comes from the proxy process, not the monitored container.
 
 ## Config
 
-Main example:
-
-```sh
-examples/stalin.toml
-```
-
-MITM example:
-
 ```sh
 examples/stalin-mitm.toml
 ```
 
-MITM requires:
+HTTPS inspection and header rewriting require MITM. Without MITM, Stalin can
+see the CONNECT target, but not the inner HTTPS request.
+
+MITM config:
 
 ```toml
 [mitm]
