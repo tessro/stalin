@@ -10,8 +10,8 @@ This repository currently contains the first working implementation:
   session handling.
 - Explicit HTTP proxying for absolute-form `HTTP_PROXY` requests.
 - HTTPS `CONNECT` tunneling with host-level allow, deny, and audit decisions.
-- Optional HTTP/1.1 MITM TLS interception for CONNECT requests when configured
-  with a trusted local CA.
+- Optional HTTP/1.1 and HTTP/2 MITM TLS interception for CONNECT requests when
+  configured with a trusted local CA.
 - HTTP/1.1 upgrade tunneling for WebSocket-style proxy traffic.
 - Rule-driven request header mutation.
 - V8 request-header plugins with secret, audit, crypto, and clock host APIs.
@@ -19,8 +19,8 @@ This repository currently contains the first working implementation:
 - JSONL audit logging.
 - Docker and Compose examples for sidecar deployment.
 
-HTTP/2-over-MITM, deep body inspection, and streaming body hooks described in
-`PLAN.md` are intentionally isolated as follow-on work.
+Deep body inspection and streaming body hooks described in `PLAN.md` are
+intentionally isolated as follow-on work.
 
 ## Run
 
@@ -51,8 +51,8 @@ ca_cert = "certs/stalin-ca.pem"
 ca_key = "certs/stalin-ca-key.pem"
 ```
 
-MITM mode currently advertises HTTP/1.1 to the client side of the intercepted
-TLS session. Upstream requests can still use TLS and Pingora's upstream HTTP/2
+MITM mode advertises `h2` and `http/1.1` to the client side of the intercepted
+TLS session. Upstream requests still use TLS and Pingora's upstream HTTP/2
 preference.
 
 ## V8 Plugins

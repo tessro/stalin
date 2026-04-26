@@ -2,8 +2,7 @@
 
 ## Core Proxy
 
-- Extend MITM TLS beyond the current HTTP/1 CONNECT path:
-  - add HTTP/2-over-MITM support after downstream TLS ALPN negotiation
+- Extend MITM TLS beyond the current CONNECT path:
   - expose CA generation/export workflow for local development
   - add integration tests with a client that trusts the configured CA
 - Make HTTP/2 proxying first-class for both client-facing and upstream traffic,

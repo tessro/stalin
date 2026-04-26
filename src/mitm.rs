@@ -111,7 +111,7 @@ impl MitmAuthority {
                 pkcs8_key(leaf_key.serialize_der()),
             )
             .context("failed to build MITM TLS server config")?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)
     }
 }
@@ -169,6 +169,17 @@ mod tests {
         let second = authority.server_config_for_host("example.com").unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn server_config_advertises_h2_before_http1() {
+        let authority = MitmAuthority::generate().unwrap();
+        let config = authority.server_config_for_host("example.com").unwrap();
+
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]

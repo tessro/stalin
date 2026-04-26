@@ -13,9 +13,11 @@ use pingora::{
     connectors::http::Connector,
     http::{RequestHeader, ResponseHeader},
     protocols::{
-        GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, Ssl, Stream, UniqueID,
-        UniqueIDType,
-        http::{ServerSession, client::HttpSession as UpstreamHttpSession},
+        Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, Ssl, Stream,
+        UniqueID, UniqueIDType,
+        http::{
+            ServerSession, client::HttpSession as UpstreamHttpSession, v2::server as h2_server,
+        },
         tls::ALPN,
     },
     server::{Server, ShutdownWatch},
@@ -51,7 +53,7 @@ impl ProxyServer {
         let audit = AuditLog::new(self.config.audit_log.as_deref())?;
         let mitm = MitmAuthority::from_config(&self.config.mitm)?.map(Arc::new);
         if mitm.is_some() {
-            warn!("MITM TLS interception enabled for HTTP/1 CONNECT sessions");
+            warn!("MITM TLS interception enabled for CONNECT sessions");
         }
         let mut options = HttpServerOptions::default();
         options.h2c = true;
@@ -295,7 +297,13 @@ impl StalinPingoraApp {
             .accept(downstream)
             .await
             .context("failed to accept downstream MITM TLS")?;
+        let selected_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
         let stream: Stream = Box::new(TlsVirtualSocket(tls));
+
+        if selected_h2 {
+            self.process_mitm_h2(stream, shutdown).await?;
+            return Ok(());
+        }
 
         let mut result = self
             .process_mitm_http(ServerSession::new_http1(stream), &shutdown)
@@ -308,6 +316,46 @@ impl StalinPingoraApp {
             result = self.process_mitm_http(session, &shutdown).await;
         }
         Ok(())
+    }
+
+    async fn process_mitm_h2(
+        self: Arc<Self>,
+        stream: Stream,
+        shutdown: ShutdownWatch,
+    ) -> anyhow::Result<()> {
+        let digest = Arc::new(Digest {
+            ssl_digest: stream.get_ssl_digest(),
+            timing_digest: stream.get_timing_digest(),
+            proxy_digest: stream.get_proxy_digest(),
+            socket_digest: stream.get_socket_digest(),
+        });
+        let mut h2_conn = h2_server::handshake(stream, self.h2_options())
+            .await
+            .map_err(|err| anyhow::anyhow!(err))
+            .context("failed to accept downstream MITM h2")?;
+        let mut shutdown = shutdown;
+
+        loop {
+            let h2_stream = tokio::select! {
+                _ = shutdown.changed() => {
+                    h2_conn.graceful_shutdown();
+                    return Ok(());
+                }
+                h2_stream = h2_server::HttpSession::from_h2_conn(&mut h2_conn, digest.clone()) => h2_stream,
+            };
+            let h2_stream = h2_stream
+                .map_err(|err| anyhow::anyhow!(err))
+                .context("failed to accept downstream MITM h2 stream")?;
+            let Some(h2_stream) = h2_stream else {
+                return Ok(());
+            };
+            let app = self.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                app.process_mitm_http(ServerSession::new_http2(h2_stream), &shutdown)
+                    .await;
+            });
+        }
     }
 
     async fn process_mitm_http(
@@ -538,7 +586,11 @@ impl UniqueID for TlsVirtualSocket {
 
 impl Ssl for TlsVirtualSocket {
     fn selected_alpn_proto(&self) -> Option<ALPN> {
-        Some(ALPN::H1)
+        match self.0.get_ref().1.alpn_protocol() {
+            Some(b"h2") => Some(ALPN::H2),
+            Some(b"http/1.1") => Some(ALPN::H1),
+            _ => None,
+        }
     }
 }
 
