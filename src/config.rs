@@ -125,10 +125,35 @@ pub enum HeaderValueConfig {
         #[serde(default = "default_secret_format")]
         format: String,
     },
+    OAuthRefreshToken {
+        oauth_refresh_token: OAuthRefreshTokenConfig,
+        #[serde(default = "default_secret_format")]
+        format: String,
+    },
 }
 
 fn default_secret_format() -> String {
     "{value}".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
+pub struct OAuthRefreshTokenConfig {
+    pub token_url: String,
+    pub client_id_env: String,
+    pub client_secret_env: String,
+    pub refresh_token_env: String,
+    #[serde(default = "default_oauth_refresh_before_expiry_seconds")]
+    pub refresh_before_expiry_seconds: u64,
+    #[serde(default = "default_oauth_expires_in_seconds")]
+    pub default_expires_in_seconds: u64,
+}
+
+fn default_oauth_refresh_before_expiry_seconds() -> u64 {
+    300
+}
+
+fn default_oauth_expires_in_seconds() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,6 +197,73 @@ remove = ["x-placeholder-authorization"]
 
         assert_eq!(cfg.listen.to_string(), "127.0.0.1:8080");
         assert_eq!(cfg.rules[0].name, "openai");
+    }
+
+    #[test]
+    fn rejects_empty_oauth_refresh_token_header_value() {
+        let err = toml::from_str::<Config>(
+            r#"
+[[rules]]
+name = "google_workspace"
+
+[rules.match]
+host = "*.googleapis.com"
+
+[rules.request_headers.set]
+authorization = { oauth_refresh_token = {}, format = "Bearer {value}" }
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("HeaderValueConfig"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_oauth_refresh_token_header_value() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[rules]]
+name = "google_workspace"
+
+[rules.match]
+host = "*.googleapis.com"
+
+[rules.request_headers.set.authorization]
+format = "Bearer {value}"
+
+[rules.request_headers.set.authorization.oauth_refresh_token]
+token_url = "https://oauth2.googleapis.com/token"
+client_id_env = "GOOGLE_WORKSPACE_CLIENT_ID"
+client_secret_env = "GOOGLE_WORKSPACE_CLIENT_SECRET"
+refresh_token_env = "GOOGLE_WORKSPACE_REFRESH_TOKEN"
+"#,
+        )
+        .unwrap();
+
+        let HeaderValueConfig::OAuthRefreshToken {
+            oauth_refresh_token,
+            format,
+        } = cfg.rules[0]
+            .request_headers
+            .set
+            .get("authorization")
+            .unwrap()
+        else {
+            panic!("expected OAuth refresh-token header value");
+        };
+
+        assert_eq!(format, "Bearer {value}");
+        assert_eq!(
+            oauth_refresh_token.token_url,
+            "https://oauth2.googleapis.com/token"
+        );
+        assert_eq!(
+            oauth_refresh_token.client_id_env,
+            "GOOGLE_WORKSPACE_CLIENT_ID"
+        );
     }
 
     #[test]

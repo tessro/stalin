@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::{
     audit::{AuditEvent, AuditLog},
     config::{Config, DenyConfig, HeaderPatchConfig, HeaderValueConfig, MatchConfig, RuleConfig},
+    oauth::OAuthRefreshTokenProvider,
     plugin::{
         PluginBodyDoneResult, PluginBodyPolicy, PluginHeaderPatch, PluginResponseHeadersResult,
         PluginResult, PluginRuntime,
@@ -17,6 +18,7 @@ use crate::{
 pub struct PolicyEngine {
     rules: Vec<RuleConfig>,
     secrets: SecretStore,
+    oauth: OAuthRefreshTokenProvider,
     audit: AuditLog,
     plugins: Option<PluginRuntime>,
 }
@@ -28,6 +30,7 @@ impl PolicyEngine {
         Ok(Self {
             rules: config.rules,
             secrets,
+            oauth: OAuthRefreshTokenProvider::new()?,
             audit,
             plugins,
         })
@@ -64,7 +67,7 @@ impl PolicyEngine {
                 return Ok(PolicyDecision::Deny(deny_response(deny)));
             }
 
-            apply_patch(headers, &rule.request_headers, &self.secrets)?;
+            apply_patch(headers, &rule.request_headers, &self.secrets, &self.oauth).await?;
         }
 
         let mut upstream = None;
@@ -432,21 +435,28 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-fn apply_patch(
+async fn apply_patch(
     headers: &mut HeaderMap,
     patch: &HeaderPatchConfig,
     secrets: &SecretStore,
+    oauth: &OAuthRefreshTokenProvider,
 ) -> anyhow::Result<()> {
     for name in &patch.remove {
         headers.remove(header_name(name)?);
     }
 
     for (name, value) in &patch.set {
-        headers.insert(header_name(name)?, header_value(value, secrets)?);
+        headers.insert(
+            header_name(name)?,
+            header_value(value, secrets, oauth).await?,
+        );
     }
 
     for (name, value) in &patch.add {
-        headers.append(header_name(name)?, header_value(value, secrets)?);
+        headers.append(
+            header_name(name)?,
+            header_value(value, secrets, oauth).await?,
+        );
     }
 
     Ok(())
@@ -476,12 +486,23 @@ fn header_name(name: &str) -> anyhow::Result<HeaderName> {
     Ok(HeaderName::from_bytes(name.as_bytes())?)
 }
 
-fn header_value(value: &HeaderValueConfig, secrets: &SecretStore) -> anyhow::Result<HeaderValue> {
+async fn header_value(
+    value: &HeaderValueConfig,
+    secrets: &SecretStore,
+    oauth: &OAuthRefreshTokenProvider,
+) -> anyhow::Result<HeaderValue> {
     let raw = match value {
         HeaderValueConfig::Literal(value) => value.clone(),
         HeaderValueConfig::Secret { secret, format } => {
             let secret = secrets.text(secret)?;
             format.replace("{value}", &secret)
+        }
+        HeaderValueConfig::OAuthRefreshToken {
+            oauth_refresh_token,
+            format,
+        } => {
+            let access_token = oauth.access_token(oauth_refresh_token).await?;
+            format.replace("{value}", &access_token)
         }
     };
     Ok(HeaderValue::from_str(&raw)?)
@@ -569,8 +590,8 @@ mod tests {
         assert_eq!(url.as_str(), "https://example.com/v1?a=b");
     }
 
-    #[test]
-    fn header_patch_sets_literals_and_removes() {
+    #[tokio::test]
+    async fn header_patch_sets_literals_and_removes() {
         let mut headers = HeaderMap::new();
         headers.insert("x-old", HeaderValue::from_static("1"));
         let patch = HeaderPatchConfig {
@@ -582,8 +603,11 @@ mod tests {
             remove: vec!["x-old".to_string()],
         };
         let secrets = SecretStore::new(HashMap::<String, SecretConfig>::new());
+        let oauth = OAuthRefreshTokenProvider::new().unwrap();
 
-        apply_patch(&mut headers, &patch, &secrets).unwrap();
+        apply_patch(&mut headers, &patch, &secrets, &oauth)
+            .await
+            .unwrap();
 
         assert!(!headers.contains_key("x-old"));
         assert_eq!(headers.get("x-new").unwrap(), "2");
